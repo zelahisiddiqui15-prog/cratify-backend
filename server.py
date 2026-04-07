@@ -24,22 +24,25 @@ def health():
 def register():
     data = request.json or {}
     email = data.get("email")
-    
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT * FROM users WHERE email = ?", (email,)
-    ).fetchone()
-    conn.close()
-    
-    if existing:
-        user = dict(existing)
-        sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
-        return jsonify({
-            "user_id": user["id"],
-            "sorts_remaining": sorts_remaining,
-            "subscription_active": bool(user["subscription_active"])
-        })
-    
+
+    if email:
+        conn = get_db()
+        try:
+            existing = conn.execute(
+                "SELECT * FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            conn.close()
+            if existing:
+                user = dict(existing)
+                sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
+                return jsonify({
+                    "user_id": user["id"],
+                    "sorts_remaining": sorts_remaining,
+                    "subscription_active": bool(user["subscription_active"])
+                })
+        except Exception:
+            conn.close()
+
     user_id = create_user(email=email)
     return jsonify({
         "user_id": user_id,
