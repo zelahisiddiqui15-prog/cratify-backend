@@ -4,7 +4,7 @@ import stripe
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from models import init_db, create_user, get_user, increment_sorts, activate_subscription, deactivate_subscription, set_stripe_customer
+from models import init_db, create_user, get_user, get_db, increment_sorts, activate_subscription, deactivate_subscription, set_stripe_customer
 
 load_dotenv()
 
