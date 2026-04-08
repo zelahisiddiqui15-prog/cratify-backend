@@ -2,4 +2,4 @@ flask
 flask-cors
 anthropic
 python-dotenv
-stripe
+stripepsycopg2-binary
