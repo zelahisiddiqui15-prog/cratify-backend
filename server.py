@@ -1,174 +1,191 @@
-import os
-import json
-import anthropic
-import stripe
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from dotenv import load_dotenv
-from models import init_db, create_user, get_user, get_db, increment_sorts, activate_subscription, deactivate_subscription, set_stripe_customer
+import time
+import threading
+import shutil
+import subprocess
+import requests
+from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from config import load_config, BACKEND_URL
 
-load_dotenv()
-
-app = Flask(__name__)
-CORS(app)
-
-anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "SortDrop API"})
+SUPPORTED_EXTENSIONS = {
+    ".wav", ".mp3", ".aiff", ".aif", ".flac", ".ogg",
+    ".fxp", ".nmsv", ".vital", ".xpf", ".aupreset",
+    ".mid", ".midi",
+}
 
 
-@app.route("/auth/register", methods=["POST"])
-def register():
-    data = request.json or {}
-    email = data.get("email")
-
-    if email:
-        conn = get_db()
-        try:
-            existing = conn.execute(
-                "SELECT * FROM users WHERE email = ?", (email,)
-            ).fetchone()
-            conn.close()
-            if existing:
-                user = dict(existing)
-                sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
-                return jsonify({
-                    "user_id": user["id"],
-                    "sorts_remaining": sorts_remaining,
-                    "subscription_active": bool(user["subscription_active"])
-                })
-        except Exception:
-            conn.close()
-
-    user_id = create_user(email=email)
-    return jsonify({
-        "user_id": user_id,
-        "sorts_remaining": 25,
-        "subscription_active": False
-    })
-
-
-@app.route("/subscription/status", methods=["GET"])
-def subscription_status():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
-
-    user = get_user(user_id)
-    if not user:
-        return jsonify({"error": "user not found"}), 404
-
-    sorts_remaining = None
-    if not user["subscription_active"]:
-        sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
-
-    return jsonify({
-        "subscription_active": bool(user["subscription_active"]),
-        "sorts_used": user["sorts_used"],
-        "sorts_remaining": sorts_remaining,
-        "trial_limit": user["trial_limit"]
-    })
-
-
-@app.route("/classify", methods=["POST"])
-def classify():
-    data = request.json or {}
-    filename = data.get("filename")
-    user_id = data.get("user_id")
-
-    if not filename or not user_id:
-        return jsonify({"error": "filename and user_id required"}), 400
-
-    user = get_user(user_id)
-    if not user:
-        return jsonify({"error": "user not found"}), 404
-
-    if not user["subscription_active"]:
-        if user["sorts_used"] >= user["trial_limit"]:
-            return jsonify({"error": "trial_exhausted"}), 402
-
-    prompt = f"""You are a music file classifier for a producer tool called SortDrop.
-
-Analyze this filename and return a JSON object with these fields:
-- category: the main sound category. Choose from: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, Loop, or Other.
-- subcategory: a more specific description (e.g. "Midrange Bass", "Supersaw Lead")
-- key: musical key if detectable from filename (e.g. "Am", "C#", "Fm") or null
-- bpm: BPM if detectable from filename as a number or null
-- file_type: one of "stem", "preset", "midi", "sample", "loop"
-- confidence: your confidence score from 0 to 1
-
-Classification rules (follow strictly):
-- If filename contains "GTR", "Gtr", "Guitar", "guitar" → category = "Guitar"
-- If filename contains "BASS", "Bass", "bass" → category = "Bass"
-- If filename contains "DRUM", "Drum", "drum", "PERC", "Perc" → category = "Drum"
-- If filename contains "VOX", "Vox", "VOCAL", "Vocal", "vocal" → category = "Vocal"
-- If filename contains "PAD", "Pad", "pad" → category = "Pad"
-- If filename contains "LEAD", "Lead", "lead" → category = "Lead"
-- If filename contains "CHORD", "Chord", "chord" → category = "Chord"
-- If filename contains "FX", "fx", "SFX", "sfx" → category = "FX"
-- If filename contains "SYNTH", "Synth", "synth" → category = "Synth"
-- If filename contains "PIANO", "Piano", "piano", "PNO" → category = "Piano"
-- Prioritize instrument type over file type — a guitar loop is "Guitar", not "Loop"
-- Only use "Loop" if no instrument type can be identified
-
-Filename: {filename}
-
-Return ONLY valid JSON with no markdown, no code fences, no explanation. Just the raw JSON object."""
-
-    message = anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=256,
-        messages=[{"role": "user", "content": prompt}]
+def osascript_confirm_sort(filename, category, key, dest):
+    """Ask user to confirm before sorting a file."""
+    label = f"{category}/{key}" if key else category
+    escaped_filename = filename.replace('"', '\\"')
+    escaped_label = label.replace('"', '\\"')
+    escaped_dest = str(dest).replace('"', '\\"')
+    script = (
+        f'tell application "System Events" to display dialog '
+        f'"SortDrop wants to move:\\n\\n{escaped_filename}\\n\\n→ {escaped_label}\\n\\nDest: {escaped_dest}" '
+        f'with title "SortDrop — Confirm Sort" '
+        f'buttons {{"Skip", "Sort It"}} default button "Sort It"'
     )
-
-    try:
-        raw = message.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        result = json.loads(raw.strip())
-    except Exception:
-        result = {
-            "category": "Other",
-            "subcategory": "Unknown",
-            "key": None,
-            "bpm": None,
-            "file_type": "stem",
-            "confidence": 0.5
-        }
-
-    increment_sorts(user_id)
-    return jsonify(result)
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return result.returncode == 0 and "Sort It" in result.stdout
 
 
-@app.route("/stripe/webhook", methods=["POST"])
-def stripe_webhook():
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature")
-    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+class MusicFileHandler(FileSystemEventHandler):
+    def __init__(self, callbacks: dict):
+        super().__init__()
+        self._processing = set()
+        self._lock = threading.Lock()
+        self._callbacks = callbacks
 
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            return
+        with self._lock:
+            if str(path) in self._processing:
+                return
+            self._processing.add(str(path))
+        threading.Thread(target=self._process, args=(path,), daemon=True).start()
 
-    if event["type"] == "customer.subscription.created":
-        sub = event["data"]["object"]
-        activate_subscription(sub["customer"], sub["id"])
+    def _process(self, path: Path):
+        time.sleep(2.5)
+        if not path.exists():
+            self._processing.discard(str(path))
+            return
 
-    elif event["type"] == "customer.subscription.deleted":
-        sub = event["data"]["object"]
-        deactivate_subscription(sub["customer"])
+        cfg = load_config()
+        user_id = cfg.get("user_id")
+        output_folder = cfg.get("output_folder")
+        confirm_mode = cfg.get("confirm_before_sort", False)
 
-    return jsonify({"status": "ok"})
+        if not user_id or not output_folder:
+            self._processing.discard(str(path))
+            return
+
+        on_sorting = self._callbacks.get("on_sorting")
+        if on_sorting:
+            on_sorting(path.name)
+
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/classify",
+                json={"filename": path.name, "user_id": user_id},
+                timeout=15,
+            )
+
+            if resp.status_code == 200:
+                result = resp.json()
+                dest = self._build_dest(output_folder, result, path.name, cfg)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+
+                # Handle filename collisions
+                if dest.exists():
+                    stem, suffix = dest.stem, dest.suffix
+                    counter = 1
+                    while dest.exists():
+                        dest = dest.parent / f"{stem}_{counter}{suffix}"
+                        counter += 1
+
+                # Confirm before sort if enabled
+                if confirm_mode:
+                    category = result.get("category", "Other")
+                    key = result.get("key", "")
+                    confirmed = osascript_confirm_sort(path.name, category, key, dest)
+                    if not confirmed:
+                        on_skip = self._callbacks.get("on_skip")
+                        if on_skip:
+                            on_skip(path.name)
+                        self._processing.discard(str(path))
+                        return
+
+                shutil.move(str(path), str(dest))
+
+                on_success = self._callbacks.get("on_success")
+                if on_success:
+                    on_success(path.name, result, str(dest))
+
+            elif resp.status_code == 402:
+                on_trial = self._callbacks.get("on_trial_exhausted")
+                if on_trial:
+                    on_trial()
+            else:
+                on_error = self._callbacks.get("on_error")
+                if on_error:
+                    on_error(f"Server error: {resp.status_code}")
+
+        except Exception as e:
+            on_error = self._callbacks.get("on_error")
+            if on_error:
+                on_error(str(e))
+
+        self._processing.discard(str(path))
+
+    def _build_dest(self, output: str, result: dict, filename: str, cfg: dict) -> Path:
+        base = Path(output)
+        category = result.get("category", "Other")
+        drum_type = result.get("drum_type", None)
+        key = result.get("key", "")
+        file_type = result.get("file_type", "stem")
+        mode = cfg.get("subfolder_mode", "category_key")
+
+        if file_type == "preset":
+            folder = base / "Presets" / category
+        elif file_type == "midi":
+            folder = base / "MIDI" / category
+        elif category == "Drum":
+            # Drums get sorted by type, not key
+            drum_folder = drum_type if drum_type else "Full Loop"
+            folder = base / "Drums" / drum_folder
+        elif mode == "category_key" and key:
+            folder = base / category / key
+        elif mode == "category_only":
+            folder = base / category
+        else:
+            folder = base / category
+
+        return folder / filename
 
 
-if __name__ == "__main__":
-    init_db()
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+class FolderWatcher:
+    def __init__(self, callbacks: dict):
+        self._callbacks = callbacks
+        self._observers = []
+
+    def start(self) -> tuple:
+        cfg = load_config()
+        watch_folders = cfg.get("watch_folders", [])
+
+        # Backwards compat — support old single watch_folder key
+        single = cfg.get("watch_folder")
+        if single and single not in watch_folders:
+            watch_folders.append(single)
+
+        if not watch_folders:
+            return False, "Watch folder not configured or doesn't exist."
+
+        valid_folders = [f for f in watch_folders if Path(f).exists()]
+        if not valid_folders:
+            return False, "Watch folder not configured or doesn't exist."
+
+        handler = MusicFileHandler(self._callbacks)
+        observer = Observer()
+        for folder in valid_folders:
+            observer.schedule(handler, folder, recursive=False)
+
+        observer.start()
+        self._observers = [observer]
+        return True, ""
+
+    def stop(self):
+        for obs in self._observers:
+            if obs.is_alive():
+                obs.stop()
+                obs.join()
+        self._observers = []
+
+    @property
+    def is_running(self):
+        return any(obs.is_alive() for obs in self._observers)
