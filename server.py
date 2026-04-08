@@ -1,4 +1,5 @@
 import os
+import json
 import anthropic
 import stripe
 from flask import Flask, request, jsonify
@@ -102,7 +103,7 @@ Analyze this filename and return a JSON object with these fields:
 
 Filename: {filename}
 
-Return ONLY valid JSON, no explanation."""
+Return ONLY valid JSON with no markdown, no code fences, no explanation. Just the raw JSON object."""
 
     message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -110,9 +111,14 @@ Return ONLY valid JSON, no explanation."""
         messages=[{"role": "user", "content": prompt}]
     )
 
-    import json
     try:
-        result = json.loads(message.content[0].text)
+        raw = message.content[0].text.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw.strip())
     except Exception:
         result = {
             "category": "Other",
