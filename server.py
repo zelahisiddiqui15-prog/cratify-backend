@@ -53,13 +53,16 @@ def register():
 @app.route("/auth/login", methods=["POST"])
 def login():
     data = request.json or {}
-    email = data.get("email")
+    identifier = data.get("email") or data.get("identifier")
     password = data.get("password")
 
-    if not email or not password:
-        return jsonify({"error": "email and password required"}), 400
+    if not identifier or not password:
+        return jsonify({"error": "email/username and password required"}), 400
 
-    user = get_user_by_email(email)
+    user = get_user_by_email(identifier)
+    if not user:
+        user = get_user_by_username(identifier)
+
     if not user:
         return jsonify({"error": "invalid credentials"}), 401
 
@@ -144,7 +147,7 @@ Return ONLY valid JSON. No markdown, no explanation."""
     message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=256,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{{"role": "user", "content": prompt}}]
     )
 
     try:
