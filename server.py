@@ -5,7 +5,10 @@ import stripe
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-from models import init_db, create_user, get_user, get_db, increment_sorts, activate_subscription, deactivate_subscription, set_stripe_customer
+from models import (init_db, create_user, get_user, get_user_by_email,
+                    get_user_by_username, username_exists, get_db,
+                    increment_sorts, activate_subscription,
+                    deactivate_subscription, set_stripe_customer, hash_password)
 
 load_dotenv()
 
@@ -18,38 +21,68 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "SortDrop API"})
+    return jsonify({"status": "ok", "service": "Cratify API"})
 
 
 @app.route("/auth/register", methods=["POST"])
 def register():
     data = request.json or {}
     email = data.get("email")
+    password = data.get("password")
+    username = data.get("username")
 
-    if email:
-        conn = get_db()
-        try:
-            existing = conn.execute(
-                "SELECT * FROM users WHERE email = ?", (email,)
-            ).fetchone()
-            conn.close()
-            if existing:
-                user = dict(existing)
-                sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
-                return jsonify({
-                    "user_id": user["id"],
-                    "sorts_remaining": sorts_remaining,
-                    "subscription_active": bool(user["subscription_active"])
-                })
-        except Exception:
-            conn.close()
+    if not email:
+        return jsonify({"error": "email required"}), 400
 
-    user_id = create_user(email=email)
+    existing = get_user_by_email(email)
+    if existing:
+        return jsonify({"error": "email already registered"}), 409
+
+    if username and username_exists(username):
+        return jsonify({"error": "username already taken"}), 409
+
+    user_id = create_user(email=email, username=username, password=password)
     return jsonify({
         "user_id": user_id,
+        "username": username,
         "sorts_remaining": 25,
         "subscription_active": False
     })
+
+
+@app.route("/auth/login", methods=["POST"])
+def login():
+    data = request.json or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "email and password required"}), 400
+
+    user = get_user_by_email(email)
+    if not user:
+        return jsonify({"error": "invalid credentials"}), 401
+
+    if user.get("password_hash") != hash_password(password):
+        return jsonify({"error": "invalid credentials"}), 401
+
+    sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
+    return jsonify({
+        "user_id": user["id"],
+        "username": user.get("username"),
+        "email": user["email"],
+        "sorts_remaining": sorts_remaining if not user["subscription_active"] else None,
+        "subscription_active": bool(user["subscription_active"])
+    })
+
+
+@app.route("/auth/check-username", methods=["GET"])
+def check_username():
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"error": "username required"}), 400
+    taken = username_exists(username)
+    return jsonify({"available": not taken, "username": username})
 
 
 @app.route("/subscription/status", methods=["GET"])
@@ -70,7 +103,9 @@ def subscription_status():
         "subscription_active": bool(user["subscription_active"]),
         "sorts_used": user["sorts_used"],
         "sorts_remaining": sorts_remaining,
-        "trial_limit": user["trial_limit"]
+        "trial_limit": user["trial_limit"],
+        "username": user.get("username"),
+        "email": user.get("email")
     })
 
 
@@ -91,44 +126,20 @@ def classify():
         if user["sorts_used"] >= user["trial_limit"]:
             return jsonify({"error": "trial_exhausted"}), 402
 
-    prompt = f"""You are a music file classifier for a producer tool called SortDrop.
+    prompt = f"""You are a music file classifier for a producer tool called Cratify.
 
 Analyze this filename and return a JSON object with these fields:
-- category: the main sound category. Choose from: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, Loop, or Other.
-- drum_type: ONLY for Drum category — the specific drum type. Choose from: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Set to null for non-drum files.
-- subcategory: a more specific description (e.g. "Midrange Bass", "Supersaw Lead")
-- key: musical key if detectable from filename (e.g. "Am", "C#", "Fm") or null. Always null for drums.
-- bpm: BPM if detectable from filename as a number or null
-- file_type: one of "stem", "preset", "midi", "sample", "loop"
-- confidence: your confidence score from 0 to 1
-
-Classification rules (follow strictly):
-- If filename contains "GTR", "Gtr", "Guitar", "guitar" → category = "Guitar"
-- If filename contains "BASS", "Bass", "bass" → category = "Bass"
-- If filename contains "DRUM", "Drum", "drum", "PERC", "Perc" → category = "Drum"
-- If filename contains "VOX", "Vox", "VOCAL", "Vocal", "vocal" → category = "Vocal"
-- If filename contains "PAD", "Pad", "pad" → category = "Pad"
-- If filename contains "LEAD", "Lead", "lead" → category = "Lead"
-- If filename contains "CHORD", "Chord", "chord" → category = "Chord"
-- If filename contains "FX", "fx", "SFX", "sfx" → category = "FX"
-- If filename contains "SYNTH", "Synth", "synth" → category = "Synth"
-- If filename contains "PIANO", "Piano", "piano", "PNO" → category = "Piano"
-- Prioritize instrument type over file type — a guitar loop is "Guitar", not "Loop"
-- Only use "Loop" if no instrument type can be identified
-
-Drum type rules (when category = "Drum"):
-- If filename contains "KICK", "Kick", "kick", "BD", "BassDrum" → drum_type = "Kick"
-- If filename contains "SNARE", "Snare", "snare", "SD" → drum_type = "Snare"
-- If filename contains "HAT", "Hat", "hat", "HH", "Hihat", "HiHat" → drum_type = "Hi-Hat"
-- If filename contains "CLAP", "Clap", "clap", "CP" → drum_type = "Clap"
-- If filename contains "PERC", "Perc", "perc" → drum_type = "Perc"
-- If filename contains "CYM", "Cymbal", "cymbal", "CRASH", "RIDE" → drum_type = "Cymbal"
-- If filename contains "TOM", "Tom", "tom" → drum_type = "Tom"
-- If no specific type detected → drum_type = "Full Loop"
+- category: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, Loop, or Other.
+- drum_type: ONLY for Drum: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null for non-drums.
+- subcategory: more specific description
+- key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
+- bpm: BPM if detectable as number or null
+- file_type: "stem", "preset", "midi", "sample", or "loop"
+- confidence: 0 to 1
 
 Filename: {filename}
 
-Return ONLY valid JSON with no markdown, no code fences, no explanation. Just the raw JSON object."""
+Return ONLY valid JSON. No markdown, no explanation."""
 
     message = anthropic_client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -145,13 +156,8 @@ Return ONLY valid JSON with no markdown, no code fences, no explanation. Just th
         result = json.loads(raw.strip())
     except Exception:
         result = {
-            "category": "Other",
-            "drum_type": None,
-            "subcategory": "Unknown",
-            "key": None,
-            "bpm": None,
-            "file_type": "stem",
-            "confidence": 0.5
+            "category": "Other", "drum_type": None, "subcategory": "Unknown",
+            "key": None, "bpm": None, "file_type": "stem", "confidence": 0.5
         }
 
     increment_sorts(user_id)
@@ -172,7 +178,6 @@ def stripe_webhook():
     if event["type"] == "customer.subscription.created":
         sub = event["data"]["object"]
         activate_subscription(sub["customer"], sub["id"])
-
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
         deactivate_subscription(sub["customer"])
