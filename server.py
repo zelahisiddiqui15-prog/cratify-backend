@@ -180,9 +180,9 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        user_id = session.get("client_reference_id")
-        customer_id = session.get("customer")
-        subscription_id = session.get("subscription")
+        user_id = session["client_reference_id"]
+        customer_id = session["customer"]
+        subscription_id = session["subscription"]
         if user_id:
             set_stripe_customer(user_id, customer_id)
             activate_subscription(customer_id, subscription_id)
