@@ -178,9 +178,14 @@ def stripe_webhook():
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
-    if event["type"] == "customer.subscription.created":
-        sub = event["data"]["object"]
-        activate_subscription(sub["customer"], sub["id"])
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        user_id = session.get("client_reference_id")
+        customer_id = session.get("customer")
+        subscription_id = session.get("subscription")
+        if user_id:
+            set_stripe_customer(user_id, customer_id)
+            activate_subscription(customer_id, subscription_id)
     elif event["type"] == "customer.subscription.deleted":
         sub = event["data"]["object"]
         deactivate_subscription(sub["customer"])
