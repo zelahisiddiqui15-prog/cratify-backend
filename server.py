@@ -222,7 +222,13 @@ def chat():
             messages=messages
         )
         reply = message.content[0].text.strip()
-        return jsonify({"reply": reply})
+
+        # Extract filenames from reply - look for .wav/.mp3 etc patterns
+        import re
+        found_files = re.findall(r'[\w&+\-\.\(\)\[\]\s]+\.(?:wav|mp3|aiff|aif|flac|mid|midi|fxp|vital)', reply, re.IGNORECASE)
+        found_files = [f.strip() for f in found_files]
+
+        return jsonify({"reply": reply, "found_files": found_files})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
