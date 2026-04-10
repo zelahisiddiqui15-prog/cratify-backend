@@ -8,7 +8,7 @@ from psycopg2.extras import RealDictCursor
 TRIAL_LIMIT = 25
 
 def get_db():
-    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="require")
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="prefer")
     return conn
 
 def hash_password(password):
