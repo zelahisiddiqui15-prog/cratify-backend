@@ -208,6 +208,24 @@ def create_checkout_session():
         return jsonify({"clientSecret": session.client_secret})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    messages = data.get("messages", [])
+    system = data.get("system", "")
+    try:
+        message = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1000,
+            system=system,
+            messages=messages
+        )
+        reply = message.content[0].text.strip()
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     import sys
     print("Starting Cratify API...", flush=True)
