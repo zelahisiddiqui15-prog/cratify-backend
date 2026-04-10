@@ -199,7 +199,7 @@ def create_checkout_session():
     user_id = data.get("user_id")
     try:
         session = stripe.checkout.Session.create(
-            ui_mode="embedded",
+            ui_mode="embedded_page",
             line_items=[{"price": os.getenv("STRIPE_PRICE_ID"), "quantity": 1}],
             mode="subscription",
             return_url=f"https://www.cratify.app/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
