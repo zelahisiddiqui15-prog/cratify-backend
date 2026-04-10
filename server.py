@@ -208,3 +208,15 @@ def create_checkout_session():
         return jsonify({"clientSecret": session.client_secret})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+if __name__ == "__main__":
+    import sys
+    print("Starting Cratify API...", flush=True)
+    try:
+        init_db()
+        print("Database initialized", flush=True)
+    except Exception as e:
+        print(f"Database error: {e}", flush=True)
+        sys.exit(1)
+    port = int(os.getenv("PORT", 5000))
+    print(f"Running on port {port}", flush=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
