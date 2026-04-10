@@ -4,3 +4,4 @@ anthropic
 python-dotenv
 psycopg2-binary
 stripe>=7.0.0
+# cache bust Thu Apr  9 20:43:32 EDT 2026
