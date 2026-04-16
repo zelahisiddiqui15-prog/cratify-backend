@@ -144,13 +144,31 @@ def classify():
     prompt = f"""You are a music file classifier for a producer tool called Cratify.
 
 Analyze this filename and return a JSON object with these fields:
-- category: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, Loop, or Other.
+- category: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, or Other.
 - drum_type: ONLY for Drum: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null for non-drums.
 - subcategory: more specific description
 - key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
 - bpm: BPM if detectable as number or null
 - file_type: "stem", "preset", "midi", "sample", or "loop"
 - confidence: 0 to 1
+
+CRITICAL CATEGORY RULES:
+Never use Loop as a standalone category. Instead classify by the instrument type:
+- Drum Loop, Beat, Break → category: Drum (set drum_type: "Full Loop")
+- Bass Loop → category: Bass
+- Synth Loop, Synth Riff → category: Synth
+- Piano Loop → category: Piano
+- Guitar Loop → category: Guitar
+- Chord Loop, Chord Stab → category: Chord
+- Melody Loop, Lead Loop → category: Lead
+- Vocal Loop, Vox Loop → category: Vocal
+- Arp Loop → category: Arp
+- Pad Loop, Atmosphere Loop → category: Pad
+- FX Loop, Riser, Sweep → category: FX
+- Texture Loop, Ambient Loop → category: Ambient
+- If a loop's instrument is truly unknown: category: Other
+
+Set file_type to "loop" whenever the filename contains "loop", "lp", "riff", "break", or "beat".
 
 Filename: {filename}
 
