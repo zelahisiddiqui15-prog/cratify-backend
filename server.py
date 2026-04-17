@@ -197,6 +197,16 @@ Return ONLY valid JSON. No markdown, no explanation."""
             "key": None, "bpm": None, "file_type": "stem", "confidence": 0.5
         }
 
+    # Post-process: drums should never have keys
+    if result.get("category") == "Drum":
+        result["key"] = None
+    # Force preset category for preset file extensions
+    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    if ext in ('fxp', 'vital', 'nmsv', 'xpf', 'aupreset', 'patch'):
+        result['category'] = 'Preset'
+        result['key'] = None
+        result['bpm'] = None
+        result['file_type'] = 'preset'
     increment_sorts(user_id)
     return jsonify(result)
 
