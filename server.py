@@ -533,7 +533,7 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
     if reply_text.startswith("```"):
         first_nl = reply_text.find("\n")
         if first_nl != -1:
-            reply_text = reply_text[firsnl+1:]
+            reply_text = reply_text[first_nl+1:]
     if reply_text.rstrip().endswith("```"):
         reply_text = reply_text.rstrip()[:-3].rstrip()
 
