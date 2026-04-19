@@ -513,15 +513,12 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
 """ + candidates_text
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    messages = conversation + [
-        {"role": "user", "content": query},
-        {"role": "assistant", "content": "{"},  # prefill forces raw JSON output
-    ]
+    messages = conversation + [{"role": "user", "content": query}]
 
     try:
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=1200,
+            max_tokens=2000,
             system=system_prompt,
             messages=messages,
         )
@@ -529,9 +526,6 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
         return jsonify({"error": f"claude_failed: {e}"}), 500
 
     reply_text = response.content[0].text.strip()
-    # Re-add the prefilled opening brace that Claude continued from.
-    if not reply_text.startswith("{"):
-        reply_text = "{" + reply_text
 
     # Strip any leading/trailing markdown fences unconditionally before parsing.
     # Some Claude responses end without the closing ``` (truncation or trailing
