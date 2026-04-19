@@ -513,7 +513,10 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
 """ + candidates_text
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    messages = conversation + [{"role": "user", "content": query}]
+    messages = conversation + [
+        {"role": "user", "content": query},
+        {"role": "assistant", "content": "{"},  # prefill forces raw JSON output
+    ]
 
     try:
         response = anthropic_client.messages.create(
@@ -526,6 +529,9 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
         return jsonify({"error": f"claude_failed: {e}"}), 500
 
     reply_text = response.content[0].text.strip()
+    # Re-add the prefilled opening brace that Claude continued from.
+    if not reply_text.startswith("{"):
+        reply_text = "{" + reply_text
 
     # Strip any leading/trailing markdown fences unconditionally before parsing.
     # Some Claude responses end without the closing ``` (truncation or trailing
@@ -584,7 +590,7 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
             continue
 
     if parsed is None:
-        print(f"[search] JSON parse failed. Raw reply: {reply_text[:300]}", flush=True)
+        print(f"[search] JSON parse failed. Raw reply (len={len(reply_text)}): {reply_text}", flush=True)
         return jsonify({
             "picks": [],
             "filters_used": {},
