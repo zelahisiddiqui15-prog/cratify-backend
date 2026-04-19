@@ -527,17 +527,57 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
 
     reply_text = response.content[0].text.strip()
 
-    fence = _re.search(r'```(?:json)?\s*(\{.*\})\s*```', reply_text, _re.DOTALL)
-    if fence:
-        reply_text = fence.group(1)
+    parsed = None
+    candidates_to_try = []
 
-    try:
-        parsed = json.loads(reply_text)
-    except json.JSONDecodeError:
+    fence = _re.search(r'```(?:json)?\s*(\{.*?\})\s*```', reply_text, _re.DOTALL)
+    if fence:
+        candidates_to_try.append(fence.group(1))
+
+    first_brace = reply_text.find('{')
+    if first_brace != -1:
+        depth = 0
+        end = -1
+        in_str = False
+        escape = False
+        for i in range(first_brace, len(reply_text)):
+            ch = reply_text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end > first_brace:
+            candidates_to_try.append(reply_text[first_brace:end])
+
+    candidates_to_try.append(reply_text)
+
+    for candidate in candidates_to_try:
+        try:
+            parsed = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+
+    if parsed is None:
+        print(f"[search] JSON parse failed. Raw reply: {reply_text[:300]}", flush=True)
         return jsonify({
             "picks": [],
             "filters_used": {},
-            "reply": reply_text,
+            "reply": "Sorry, I had trouble formatting that response. Try rephrasing your search.",
             "broad_count": 0,
             "error": "parse_failed",
         })
