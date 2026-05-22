@@ -217,6 +217,113 @@ Return ONLY valid JSON. No markdown, no explanation."""
     return jsonify(result)
 
 
+@app.route("/classify_preset", methods=["POST"])
+def classify_preset():
+    """Preset-aware classifier — sub-arc 1d.
+
+    Called by PresetExtractor as Tier 4 when Tiers 1-3 (parser, folder,
+    filename) leave fewer than 4 tags. Returns granular preset_category,
+    vibe_tags, and use_case via tool_use for structured output.
+
+    Auth/billing mirrors /classify: requires user_id, increments sorts,
+    returns 402 trial_exhausted for over-quota free users.
+    """
+    data = request.json or {}
+    filename = data.get("filename")
+    user_id = data.get("user_id")
+    plugin_name = (data.get("plugin_name") or "Unknown").strip() or "Unknown"
+    vendor = (data.get("vendor") or "Unknown").strip() or "Unknown"
+    folder_name = (data.get("folder_name") or "").strip()
+    current_tags = (data.get("current_tags") or "").strip()
+
+    if not filename or not user_id:
+        return jsonify({"error": "filename and user_id required"}), 400
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+
+    if not user["subscription_active"]:
+        if user["sorts_used"] >= user["trial_limit"]:
+            return jsonify({"error": "trial_exhausted"}), 402
+
+    system_prompt = (
+        "You classify music plugin presets (Vital, Serum, Omnisphere, "
+        "u-he, FL Studio, etc.) for a producer search tool called Cratify.\n\n"
+        "Given a preset filename plus whatever context is available, "
+        "determine the granular category, mood/character descriptors, and "
+        "intended use case.\n\n"
+        "CRITICAL RULES:\n"
+        "- preset_category MUST be one of the allowed values in the tool schema.\n"
+        "- vibe_tags describe how the preset SOUNDS, not what it IS. "
+        "Avoid restating the category as a vibe.\n"
+        "- NEVER infer BPM or musical key — presets don't have those.\n"
+        "- If filename is generic (e.g., 'Preset 01', 'Init', 'Default') "
+        "and there's no other context, return low confidence with best guess.\n"
+        "- Plugin/vendor/folder context is signal — use it. A preset under "
+        "/Cymatics/Future Bass/ leans dark and evolving even if filename is bland.\n"
+        "- Return via the return_preset_classification tool. No prose, no JSON in text."
+    )
+
+    user_prompt = (
+        f"Filename: {filename}\n"
+        f"Plugin: {plugin_name}\n"
+        f"Vendor: {vendor}\n"
+        f"Parent folder: {folder_name or '(unknown)'}\n"
+        f"Existing tags from parser/filename: {current_tags or '(none)'}"
+    )
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            tools=[_PRESET_CLASSIFY_TOOL_SCHEMA],
+            tool_choice={
+                "type": "tool",
+                "name": "return_preset_classification",
+            },
+        )
+    except Exception as api_err:
+        print(f"[classify_preset] Anthropic API error: {api_err}", flush=True)
+        return jsonify({"error": str(api_err)}), 500
+
+    # Extract the tool_use block — tool_choice forces this
+    tool_use = None
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use" and \
+                getattr(block, "name", None) == "return_preset_classification":
+            tool_use = block
+            break
+
+    if tool_use is None:
+        print(f"[classify_preset] no tool_use returned. Content: "
+              f"{response.content}", flush=True)
+        return jsonify({"error": "no_tool_use"}), 500
+
+    parsed = tool_use.input  # schema-validated dict
+
+    # Normalize: preset_category to lowercase, vibe_tags to clean list
+    preset_category = (parsed.get("preset_category") or "other").lower().strip()
+    vibe_tags = [
+        str(t).strip().lower()
+        for t in (parsed.get("vibe_tags") or [])
+        if t and str(t).strip()
+    ]
+    use_case = (parsed.get("use_case") or "").strip()
+    confidence = float(parsed.get("confidence") or 0.5)
+
+    increment_sorts(user_id)
+
+    return jsonify({
+        "preset_category": preset_category,
+        "vibe_tags": vibe_tags,
+        "use_case": use_case,
+        "confidence": confidence,
+    })
+
+
 @app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
     payload = request.data
@@ -258,6 +365,53 @@ def create_checkout_session():
         return jsonify({"clientSecret": session.client_secret})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# ── Preset classification tool schema (sub-arc 1d) ─────────────────
+_PRESET_CLASSIFY_TOOL_SCHEMA = {
+    "name": "return_preset_classification",
+    "description": (
+        "Classify a music plugin preset by granular category and vibe. "
+        "Returns structured fields the Cratify desktop app stores in "
+        "the files table."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "preset_category": {
+                "type": "string",
+                "description": (
+                    "Granular preset type. MUST be one of: "
+                    "bass, lead, pad, pluck, stab, chord, arp, fx, "
+                    "keys, perc, drum, vocal, brass, strings, guitar, other."
+                ),
+            },
+            "vibe_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "1-4 short character/mood descriptors. Examples: "
+                    "dark, bright, warm, evolving, punchy, dreamy, "
+                    "aggressive, mellow, dirty, clean, vintage, modern, "
+                    "lofi, ethereal, huge, tight, wet, dry."
+                ),
+            },
+            "use_case": {
+                "type": "string",
+                "description": (
+                    "Suggested musical context: 'intro', 'drop', "
+                    "'breakdown', 'lead line', 'ambient bed', 'chord stab', "
+                    "etc. Empty string if unclear."
+                ),
+            },
+            "confidence": {
+                "type": "number",
+                "description": "0.0-1.0 confidence in the classification.",
+            },
+        },
+        "required": ["preset_category", "vibe_tags", "confidence"],
+    },
+}
+
 
 _INTENT_SYSTEM = """You parse music producer chat messages into structured bulk file actions.
 
