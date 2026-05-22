@@ -387,12 +387,25 @@ _PRESET_CLASSIFY_TOOL_SCHEMA = {
             },
             "vibe_tags": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "string",
+                    "minLength": 2,
+                    "description": (
+                        "A single vibe word like 'dark' or 'warm'. "
+                        "Must be a complete word, never a single character "
+                        "or comma-separated list."
+                    ),
+                },
                 "description": (
-                    "1-4 short character/mood descriptors. Examples: "
-                    "dark, bright, warm, evolving, punchy, dreamy, "
-                    "aggressive, mellow, dirty, clean, vintage, modern, "
-                    "lofi, ethereal, huge, tight, wet, dry."
+                    "Array of 1-4 short character/mood descriptors. "
+                    "Each array element is ONE complete word. "
+                    "Correct examples: ['dark', 'evolving'] or "
+                    "['warm', 'punchy', 'lofi']. "
+                    "INCORRECT (do not do this): "
+                    "['d','a','r','k'] or ['dark, evolving']. "
+                    "Vocabulary: dark, bright, warm, evolving, punchy, "
+                    "dreamy, aggressive, mellow, dirty, clean, vintage, "
+                    "modern, lofi, ethereal, huge, tight, wet, dry."
                 ),
             },
             "use_case": {
