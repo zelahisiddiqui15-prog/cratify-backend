@@ -471,6 +471,43 @@ Examples:
 """
 
 
+@app.route("/describe_reference", methods=["POST"])
+def describe_reference():
+    """Gate R1v2 — producer-voice read of a reference track's measured
+    feature timeline. TEXT in, short read out. The client shows it in an
+    approve/edit gate (genre calls will sometimes be wrong — the user's
+    edit is the correction layer), and the read is CHARACTER context
+    only: the project's own key/BPM govern matching client-side."""
+    data = request.json or {}
+    features_text = data.get("features_text")
+    if not features_text or not isinstance(features_text, str):
+        return jsonify({"error": "features_text required"}), 400
+
+    prompt = f"""You are an experienced music producer describing a reference track
+to a collaborator, based ONLY on measured features (no audio access).
+
+Measured feature timeline:
+{features_text[:2000]}
+
+Write 1-3 sentences in a natural producer voice describing the track's
+character and structure (energy arc, sections, tone). You may suggest a
+genre feel ONLY if the features support it, hedged ("feels like...").
+Never invent specifics the features don't show. Return ONLY the
+description text, no preamble."""
+
+    try:
+        message = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        read = message.content[0].text.strip()
+        return jsonify({"read": read})
+    except Exception as api_err:
+        print(f"[describe_reference] Anthropic API error: {api_err}", flush=True)
+        return jsonify({"error": "model_error"}), 502
+
+
 @app.route("/intent", methods=["POST"])
 def intent():
     """Parse a chat message for bulk file action intent using Claude Haiku."""
