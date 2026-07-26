@@ -471,6 +471,68 @@ Examples:
 """
 
 
+@app.route("/suggest_prompts", methods=["POST"])
+def suggest_prompts():
+    """Gate C10 — conversation-aware prompt suggestions (endpoint #2 of
+    the R1v2 pattern). Input: the project context block (same builder as
+    /search feeds), the chat's recent messages, and a compact library
+    sketch. Output: 3-4 short producer-voice prompt strings the user
+    could send NEXT — actionable for THIS conversation and THIS song,
+    never generic, never repeating what was just asked."""
+    data = request.json or {}
+    context_block = data.get("context_block") or ""
+    messages = data.get("messages") or []
+    sketch = data.get("library_sketch") or ""
+    if not isinstance(messages, list):
+        return jsonify({"error": "messages must be a list"}), 400
+    if not context_block and not messages:
+        return jsonify({"error": "context_block or messages required"}), 400
+
+    convo = "\n".join(
+        f"{m.get('role','?')}: {str(m.get('content',''))[:300]}"
+        for m in messages[-6:] if isinstance(m, dict)
+    )
+    ctx_part = ("PROJECT CONTEXT:\n" + context_block[:1200]) if context_block else "No project context — suggest library discovery prompts."
+    convo_part = ("RECENT CONVERSATION:\n" + convo) if convo else "This is a brand-new empty chat."
+    sketch_part = ("LIBRARY SKETCH: " + sketch[:400]) if sketch else ""
+    prompt = f"""You suggest the user's NEXT search prompt in Cratify, a sample-library
+tool for music producers. The user types prompts to find samples/presets/MIDI.
+
+{ctx_part}
+
+{convo_part}
+
+{sketch_part}
+
+Return a JSON array of 3-4 short prompt strings (each under 12 words,
+producer voice, first person, concrete). Rules:
+- Each must be an actionable NEXT step for THIS conversation and song.
+- Never generic filler; never repeat or trivially rephrase what was just asked.
+- If conversation exists, at least 2 suggestions must build on it.
+Return ONLY the JSON array, no markdown, no explanation."""
+
+    try:
+        message = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=250,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        import json as _json
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`").lstrip("json").strip()
+        prompts = _json.loads(raw)
+        if not isinstance(prompts, list):
+            raise ValueError("not a list")
+        prompts = [str(x).strip() for x in prompts if str(x).strip()][:4]
+        if not prompts:
+            raise ValueError("empty")
+        return jsonify({"prompts": prompts})
+    except Exception as api_err:
+        print(f"[suggest_prompts] error: {api_err}", flush=True)
+        return jsonify({"error": "model_error"}), 502
+
+
 @app.route("/describe_reference", methods=["POST"])
 def describe_reference():
     """Gate R1v2 — producer-voice read of a reference track's measured
