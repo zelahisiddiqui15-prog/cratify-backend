@@ -883,6 +883,7 @@ Guidelines for your response:
 - NEVER mention the [ID] numbers in your reply text. Refer to samples by filename or short descriptor ("the F wub one-shot", "that Cm kick").
 - filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
 - category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
+- progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
 
 You MUST respond by calling the return_search_results tool. Do not respond with text.
 
@@ -911,6 +912,24 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
                 "reply": {
                     "type": "string",
                     "description": "Producer-friendly explanation, 2-3 short paragraphs separated by blank lines.",
+                },
+                "progression": {
+                    "type": "array",
+                    "description": "OPTIONAL — only when the reply prescribes a chord sequence. One entry per step, playing order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "integer", "description": "1-based position in the sequence."},
+                            "roman": {"type": "string", "description": "Roman numeral, e.g. 'i', 'VI'."},
+                            "chord": {"type": "string", "description": "Chord name, e.g. 'Fm', 'Db maj'."},
+                            "pick_ids": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "Candidate ids whose filename matches this chord, best first. Empty if none match — never force.",
+                            },
+                        },
+                        "required": ["step", "roman", "chord", "pick_ids"],
+                    },
                 },
                 "filters_used": {
                     "type": "object",
@@ -964,12 +983,16 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
 
     parsed = tool_use.input  # guaranteed dict matching schema
 
-    return jsonify({
+    out = {
         "picks": parsed.get("picks", []),
         "filters_used": parsed.get("filters_used", {}),
         "reply": parsed.get("reply", ""),
         "broad_count": 0,
-    })
+    }
+    prog = parsed.get("progression")
+    if isinstance(prog, list) and prog:
+        out["progression"] = prog
+    return jsonify(out)
 
 
 if __name__ == "__main__":
