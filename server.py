@@ -964,8 +964,19 @@ def search():
         for c in candidates[:50]
     )
 
-    system_prompt = SEARCH_SYSTEM_DIRECTIVES + candidates_text
-
+    # Gate BE1 — system is now TWO blocks, not one concatenated string. The
+    # cache breakpoint sits on the stable half; render order is tools ->
+    # system, so the marker covers [tools + directives]. The candidate list
+    # is volatile per message and must stay AFTER the breakpoint or it would
+    # invalidate the very prefix we are trying to cache.
+    system_blocks = [
+        {
+            "type": "text",
+            "text": SEARCH_SYSTEM_DIRECTIVES,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": candidates_text},
+    ]
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     messages = conversation + [{"role": "user", "content": query}]
@@ -974,7 +985,12 @@ def search():
         response = anthropic_client.messages.create(
             model=SEARCH_MODEL,
             max_tokens=2000,
-            system=system_prompt,
+            # Gate BE1 decision #3 — preserve today's behaviour exactly.
+            # Sonnet 5 runs ADAPTIVE thinking when this is omitted (4.6 ran
+            # thinking-off), which would share the 2000-token budget with the
+            # forced tool call and risk truncating structured output.
+            thinking={"type": "disabled"},
+            system=system_blocks,
             messages=messages,
             tools=[SEARCH_TOOL_SCHEMA],
             tool_choice={"type": "tool", "name": "return_search_results"},
@@ -991,6 +1007,20 @@ def search():
             tool_use = block
             break
 
+    # Gate BE1 decision #5 — report what the call actually cost instead of
+    # letting the client assume a flat constant. This is what made the old
+    # ai_budget ledger drift (LED1/LED1b): spend was assumed, never measured.
+    # It also makes every future model or caching change self-measuring.
+    _u = response.usage
+    usage_out = {
+        "model": SEARCH_MODEL,
+        "input_tokens": _u.input_tokens,
+        "output_tokens": _u.output_tokens,
+        "cache_creation_input_tokens": getattr(_u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(_u, "cache_read_input_tokens", 0) or 0,
+    }
+    print(f"[search] usage {usage_out}", flush=True)
+
     if tool_use is None:
         print(f"[search] no tool_use block returned. Content: {response.content}", flush=True)
         return jsonify({
@@ -999,6 +1029,7 @@ def search():
             "reply": "Sorry, I had trouble formatting that response. Try rephrasing your search.",
             "broad_count": 0,
             "error": "no_tool_use",
+            "usage": usage_out,
         })
 
     parsed = tool_use.input  # guaranteed dict matching schema
@@ -1008,6 +1039,7 @@ def search():
         "filters_used": parsed.get("filters_used", {}),
         "reply": parsed.get("reply", ""),
         "broad_count": 0,
+        "usage": usage_out,
     }
     prog = parsed.get("progression")
     if isinstance(prog, list) and prog:
