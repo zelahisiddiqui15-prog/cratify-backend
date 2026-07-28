@@ -22,6 +22,15 @@ load_dotenv()
 # stable prefix hoisted to module level: it must be a byte-stable prefix
 # for prompt caching to have anything to match on.
 SMALL_MODEL = "claude-haiku-4-5-20251001"
+# PRICING WATCH, dated 2026-07-28 (Gate BE1). Staying on claude-sonnet-4-6
+# is a MEASURED choice, not inertia. claude-sonnet-5 is $2/$10 per MTok on
+# introductory pricing through 2026-08-31, then $3/$15 — the same sticker as
+# 4.6, but NOT the same cost: its tokenizer bills ~22% more tokens for
+# identical text (measured on this very prompt: the /search stable prefix is
+# 1,995 tokens on 4.6 vs 2,436 on 5). So from 2026-09-01 an identical
+# request costs ~22% MORE on Sonnet 5, permanently.
+# Also note: Sonnet 5 runs ADAPTIVE thinking when `thinking` is omitted,
+# unlike 4.6 — see the explicit {"type": "disabled"} at the /search call.
 SEARCH_MODEL = "claude-sonnet-4-6"
 
 SEARCH_SYSTEM_DIRECTIVES = """You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
