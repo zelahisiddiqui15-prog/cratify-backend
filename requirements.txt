@@ -1,6 +1,6 @@
 flask
 flask-cors
-anthropic
+anthropic==0.91.0
 python-dotenv
 psycopg2-binary
 stripe>=7.0.0

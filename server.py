@@ -18,6 +18,90 @@ from models import (init_db, create_user, get_user, get_user_by_email,
 
 load_dotenv()
 
+# --- Gate BE1 --- model ids in ONE place per tier, and the /search
+# stable prefix hoisted to module level: it must be a byte-stable prefix
+# for prompt caching to have anything to match on.
+SMALL_MODEL = "claude-haiku-4-5-20251001"
+SEARCH_MODEL = "claude-sonnet-4-6"
+
+SEARCH_SYSTEM_DIRECTIVES = """You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
+
+The user will ask for sounds. You have been given the top-50 most semantically similar samples from their library, pre-ranked by vector similarity. Your job is to analyze them, identify the best matches, write a concise producer-friendly explanation, and infer the broader filter criteria for a "see more" button.
+
+Guidelines for your response:
+- PERSONALIZATION: the query may begin with a "USER PREFERENCES" block and/or a "RECENT CORRECTIONS IN THIS CHAT" block. Treat every preference line as a standing instruction — check your response against each before finalizing. Preferences shape tone, pick ORDERING (e.g. "show Orbit samples first when they match" = lead with matching Orbit-pack files where they genuinely fit), and explanation style. They are best-effort ranking hints, NOT hard filters, and they NEVER override truthfulness — a preference cannot invent a match or reorder in a sound that does not fit. Honor RECENT CORRECTIONS literally: do not repeat a mistake the user just thumbed down.
+- CONTEXT: the conversation history precedes the latest message. If the latest message is a follow-up ("okay how about vital?", "something darker", "more like that", "in F minor instead"), interpret it AS A REFINEMENT of the previous request in this thread — never as a cold literal search. "okay how about vital?" after a bass hunt means "that same bass search, but Vital presets." A follow-up inherits the instrument/vibe/context of what came before unless it clearly changes them.
+- CATEGORY: if the user names an instrument or category (drums, bass, pads, vocals, chords, keys, leads...), your picks MUST be of that category. A follow-up that names NO category inherits the category of the previous turn — "okay how about serum?" after a bass hunt means SERUM BASS presets, not whatever else Serum makes — unless the user names a new one, which replaces it. The candidate list is already weighted toward it. If you include an off-category pick, your reply MUST say why it earns its place ("threw in a pad since it doubles as a bass layer"). Otherwise, stay on-category.
+- picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
+- reply: talk like a producer friend texting back — plain, warm, concrete. Max 3-4 short sentences in 2-3 short paragraphs (blank line between). Say what to DO with the sounds ("layer these two", "pitch this up a bit", "sits right under your vocal") over music theory for its own sake. Skip jargon (modal interchange, voice leading, "relative minor", "pitch-adjust tolerances") UNLESS the user used that kind of language first. No run-on sentences.
+- NEVER mention the [ID] numbers in your reply text. Refer to samples by filename or short descriptor ("the F wub one-shot", "that Cm kick").
+- filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
+- category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
+- progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
+
+You MUST respond by calling the return_search_results tool. Do not respond with text.
+
+The user's library samples (pre-ranked by similarity, ID in brackets):
+"""
+
+SEARCH_TOOL_SCHEMA = {
+    "name": "return_search_results",
+    "description": "Return ranked sample picks with an explanation and inferred filters.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "picks": {
+                "type": "array",
+                "description": "Best matching samples, 0-8 items, ranked by relevance.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Sample ID from the candidates list."},
+                        "score": {"type": "number", "description": "Match quality 0.0-1.0."},
+                        "reason": {"type": "string", "description": "Short phrase explaining why this matches."},
+                    },
+                    "required": ["id", "score", "reason"],
+                },
+            },
+            "reply": {
+                "type": "string",
+                "description": "Producer-friendly explanation, 2-3 short paragraphs separated by blank lines.",
+            },
+            "progression": {
+                "type": "array",
+                "description": "OPTIONAL — only when the reply prescribes a chord sequence. One entry per step, playing order.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step": {"type": "integer", "description": "1-based position in the sequence."},
+                        "roman": {"type": "string", "description": "Roman numeral, e.g. 'i', 'VI'."},
+                        "chord": {"type": "string", "description": "Chord name, e.g. 'Fm', 'Db maj'."},
+                        "pick_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "Candidate ids whose filename matches this chord, best first. Empty if none match — never force.",
+                        },
+                    },
+                    "required": ["step", "roman", "chord", "pick_ids"],
+                },
+            },
+            "filters_used": {
+                "type": "object",
+                "description": "Broader filter criteria the user might want (for 'see more' button).",
+                "properties": {
+                    "category": {"type": "string"},
+                    "key": {"type": "string"},
+                    "bpm_min": {"type": "integer"},
+                    "bpm_max": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+        "required": ["picks", "reply", "filters_used"],
+    },
+}
+
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 
@@ -182,7 +266,7 @@ Return ONLY valid JSON. No markdown, no explanation."""
 
     try:
         message = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=256,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -275,7 +359,7 @@ def classify_preset():
 
     try:
         response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=400,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
@@ -520,7 +604,7 @@ Return ONLY the JSON array, no markdown, no explanation."""
 
     try:
         message = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=250,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -566,7 +650,7 @@ description text, no preamble."""
 
     try:
         message = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -586,7 +670,7 @@ def intent():
         return jsonify({"action": None})
     try:
         resp = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=256,
             system=_INTENT_SYSTEM,
             messages=[{"role": "user", "content": message}]
@@ -827,7 +911,7 @@ Generate the 1-liner."""
             api_key=os.environ["ANTHROPIC_API_KEY"]
         )
         response = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=SMALL_MODEL,
             max_tokens=60,
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
@@ -880,89 +964,15 @@ def search():
         for c in candidates[:50]
     )
 
-    system_prompt = """You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
+    system_prompt = SEARCH_SYSTEM_DIRECTIVES + candidates_text
 
-The user will ask for sounds. You have been given the top-50 most semantically similar samples from their library, pre-ranked by vector similarity. Your job is to analyze them, identify the best matches, write a concise producer-friendly explanation, and infer the broader filter criteria for a "see more" button.
-
-Guidelines for your response:
-- PERSONALIZATION: the query may begin with a "USER PREFERENCES" block and/or a "RECENT CORRECTIONS IN THIS CHAT" block. Treat every preference line as a standing instruction — check your response against each before finalizing. Preferences shape tone, pick ORDERING (e.g. "show Orbit samples first when they match" = lead with matching Orbit-pack files where they genuinely fit), and explanation style. They are best-effort ranking hints, NOT hard filters, and they NEVER override truthfulness — a preference cannot invent a match or reorder in a sound that does not fit. Honor RECENT CORRECTIONS literally: do not repeat a mistake the user just thumbed down.
-- CONTEXT: the conversation history precedes the latest message. If the latest message is a follow-up ("okay how about vital?", "something darker", "more like that", "in F minor instead"), interpret it AS A REFINEMENT of the previous request in this thread — never as a cold literal search. "okay how about vital?" after a bass hunt means "that same bass search, but Vital presets." A follow-up inherits the instrument/vibe/context of what came before unless it clearly changes them.
-- CATEGORY: if the user names an instrument or category (drums, bass, pads, vocals, chords, keys, leads...), your picks MUST be of that category. A follow-up that names NO category inherits the category of the previous turn — "okay how about serum?" after a bass hunt means SERUM BASS presets, not whatever else Serum makes — unless the user names a new one, which replaces it. The candidate list is already weighted toward it. If you include an off-category pick, your reply MUST say why it earns its place ("threw in a pad since it doubles as a bass layer"). Otherwise, stay on-category.
-- picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
-- reply: talk like a producer friend texting back — plain, warm, concrete. Max 3-4 short sentences in 2-3 short paragraphs (blank line between). Say what to DO with the sounds ("layer these two", "pitch this up a bit", "sits right under your vocal") over music theory for its own sake. Skip jargon (modal interchange, voice leading, "relative minor", "pitch-adjust tolerances") UNLESS the user used that kind of language first. No run-on sentences.
-- NEVER mention the [ID] numbers in your reply text. Refer to samples by filename or short descriptor ("the F wub one-shot", "that Cm kick").
-- filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
-- category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
-- progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
-
-You MUST respond by calling the return_search_results tool. Do not respond with text.
-
-The user's library samples (pre-ranked by similarity, ID in brackets):
-""" + candidates_text
-
-    SEARCH_TOOL_SCHEMA = {
-        "name": "return_search_results",
-        "description": "Return ranked sample picks with an explanation and inferred filters.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "picks": {
-                    "type": "array",
-                    "description": "Best matching samples, 0-8 items, ranked by relevance.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "integer", "description": "Sample ID from the candidates list."},
-                            "score": {"type": "number", "description": "Match quality 0.0-1.0."},
-                            "reason": {"type": "string", "description": "Short phrase explaining why this matches."},
-                        },
-                        "required": ["id", "score", "reason"],
-                    },
-                },
-                "reply": {
-                    "type": "string",
-                    "description": "Producer-friendly explanation, 2-3 short paragraphs separated by blank lines.",
-                },
-                "progression": {
-                    "type": "array",
-                    "description": "OPTIONAL — only when the reply prescribes a chord sequence. One entry per step, playing order.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {"type": "integer", "description": "1-based position in the sequence."},
-                            "roman": {"type": "string", "description": "Roman numeral, e.g. 'i', 'VI'."},
-                            "chord": {"type": "string", "description": "Chord name, e.g. 'Fm', 'Db maj'."},
-                            "pick_ids": {
-                                "type": "array",
-                                "items": {"type": "integer"},
-                                "description": "Candidate ids whose filename matches this chord, best first. Empty if none match — never force.",
-                            },
-                        },
-                        "required": ["step", "roman", "chord", "pick_ids"],
-                    },
-                },
-                "filters_used": {
-                    "type": "object",
-                    "description": "Broader filter criteria the user might want (for 'see more' button).",
-                    "properties": {
-                        "category": {"type": "string"},
-                        "key": {"type": "string"},
-                        "bpm_min": {"type": "integer"},
-                        "bpm_max": {"type": "integer"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "required": ["picks", "reply", "filters_used"],
-        },
-    }
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     messages = conversation + [{"role": "user", "content": query}]
 
     try:
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6",
+            model=SEARCH_MODEL,
             max_tokens=2000,
             system=system_prompt,
             messages=messages,
@@ -1002,6 +1012,81 @@ The user's library samples (pre-ranked by similarity, ID in brackets):
     prog = parsed.get("progression")
     if isinstance(prog, list) and prog:
         out["progression"] = prog
+    return jsonify(out)
+
+
+@app.route("/be1_probe", methods=["POST"])
+def be1_probe():
+    """Gate BE1 measurement probe — TEMPORARY, removed before BE1 ships.
+
+    Answers one question with numbers instead of estimates: is the /search
+    stable prefix long enough to cache at all? A prefix under the model's
+    minimum caches NOTHING and reports no error, so shipping cache_control
+    blind risks a silent no-op.
+
+    mode=count  -> count_tokens only. FREE, no spend, no message send.
+    mode=cache  -> ONE real send with cache_control on the stable prefix;
+                   cache_creation_input_tokens > 0 proves it cached.
+
+    Secret-gated: the AI endpoints are still unmetered/unauthed, and an open
+    endpoint that burns API tokens is not something to leave lying around.
+    """
+    expected = os.environ.get("SECRET_KEY")
+    if not expected or request.headers.get("X-BE1-Probe") != expected:
+        return jsonify({"error": "forbidden"}), 403
+
+    data = request.get_json(force=True) or {}
+    mode = data.get("mode", "count")
+    models = data.get("models", [SEARCH_MODEL, "claude-sonnet-5"])
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    out = {"mode": mode, "stable_prefix_chars": len(SEARCH_SYSTEM_DIRECTIVES), "results": {}}
+
+    for model in models:
+        entry = {}
+        try:
+            # The cacheable prefix is tools + the stable system directives.
+            stable = client.messages.count_tokens(
+                model=model,
+                system=SEARCH_SYSTEM_DIRECTIVES,
+                tools=[SEARCH_TOOL_SCHEMA],
+                messages=[{"role": "user", "content": "x"}],
+            )
+            entry["stable_prefix_tokens"] = stable.input_tokens
+        except Exception as e:
+            entry["count_tokens_error"] = str(e)
+
+        if mode == "cache":
+            try:
+                r = client.messages.create(
+                    model=model,
+                    max_tokens=1024,
+                    thinking={"type": "disabled"},
+                    system=[{
+                        "type": "text",
+                        "text": SEARCH_SYSTEM_DIRECTIVES,
+                        "cache_control": {"type": "ephemeral"},
+                    }, {
+                        "type": "text",
+                        "text": "[1] probe candidate — kick, F min, 120bpm",
+                    }],
+                    messages=[{"role": "user", "content": "find me a kick"}],
+                    tools=[SEARCH_TOOL_SCHEMA],
+                    tool_choice={"type": "tool", "name": "return_search_results"},
+                )
+                u = r.usage
+                entry["usage"] = {
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                    "cache_creation_input_tokens": getattr(u, "cache_creation_input_tokens", None),
+                    "cache_read_input_tokens": getattr(u, "cache_read_input_tokens", None),
+                }
+                entry["stop_reason"] = r.stop_reason
+            except Exception as e:
+                entry["send_error"] = str(e)
+
+        out["results"][model] = entry
+
     return jsonify(out)
 
 
