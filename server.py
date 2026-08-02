@@ -1080,9 +1080,14 @@ def search():
     # FIX4 item 1 — mentions ride the same optional-passthrough shape as
     # progression (C11 precedent): present only when the model produced them,
     # so an older client that ignores the key is unaffected.
+    # FIX4b — pass mentions through even when EMPTY. The old `and mentions`
+    # made "model returned []" indistinguishable from "model omitted it"
+    # client-side, which is exactly the ambiguity that cost FIX4 two sends.
+    # The client already treats an empty array as no-chips.
     mentions = parsed.get("mentions")
-    if isinstance(mentions, list) and mentions:
+    if isinstance(mentions, list):
         out["mentions"] = mentions
+    print(f"[search] tool keys={sorted(parsed.keys())} mentions={len(mentions) if isinstance(mentions, list) else 'ABSENT'}", flush=True)
     return jsonify(out)
 
 
