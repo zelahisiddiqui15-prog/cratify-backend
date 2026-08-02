@@ -48,8 +48,9 @@ Guidelines for your response:
   Use a theory term ONLY if the user's own message used that kind of language first. Then match their level and go as deep as they did — a user who asks about modal interchange gets a real answer, not a dumbed-down one.
   Do NOT wrap filenames or file references in ** or any markdown emphasis. The UI turns file references into interactive chips, and stray asterisks render as literal characters.
   Short sentences. No run-ons. No lecturing.
-- NEVER mention the [ID] numbers in your reply text. Refer to samples by short descriptor ("the F wub one-shot", "that Cm kick") or by name — whichever reads more naturally. Do not paste long raw filenames into prose.
-- mentions: EVERY time your reply refers to a specific candidate file, add one entry to mentions: the candidate's id, and `text` = the EXACT substring of your reply that names it, copied character-for-character (same spelling, same case, no surrounding punctuation) so it can be located by plain string search. Keep writing naturally — mentions is what lets the UI turn your own words into a play/reveal chip, so you do NOT need to switch to raw filenames to be actionable. Only ids present in the candidate list. If your reply names no specific file, omit mentions.
+- NEVER mention the [ID] numbers in your reply text.
+- HOW TO NAME A FILE IN PROSE: use a SHORT HUMAN DESCRIPTOR, not the raw filename. Write "the smooth 808", "that reso 808", "the KSHMR sub" — NOT "91V_LRB_808_smooth_C.wav". Long underscored filenames are unreadable mid-sentence and the UI renders your descriptor as a clickable chip anyway, so the user never needs to see the raw name to act on it.
+- mentions (REQUIRED FIELD): for EVERY file reference in your reply, add {id, text} where `text` is the EXACT substring of your reply naming it, copied character-for-character — same spelling, same case, no trailing punctuation — so it can be found by plain string search. If your reply mentions three files, mentions has three entries. This is what turns your words into play/reveal buttons; a reference with no mentions entry is dead text to the user. Only ids from the candidate list. If the reply genuinely names no file, return an empty array.
 - filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
 - category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
 - progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
@@ -102,7 +103,7 @@ SEARCH_TOOL_SCHEMA = {
             },
             "mentions": {
                 "type": "array",
-                "description": "OPTIONAL — one entry per place the reply text refers to a specific candidate file.",
+                "description": "REQUIRED. One entry per place the reply text refers to a specific candidate file. Empty array [] if the reply names no file at all.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -127,7 +128,7 @@ SEARCH_TOOL_SCHEMA = {
                 },
             },
         },
-        "required": ["picks", "reply", "filters_used"],
+        "required": ["picks", "reply", "filters_used", "mentions"],
     },
 }
 
