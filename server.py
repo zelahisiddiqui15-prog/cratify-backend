@@ -42,8 +42,14 @@ Guidelines for your response:
 - CONTEXT: the conversation history precedes the latest message. If the latest message is a follow-up ("okay how about vital?", "something darker", "more like that", "in F minor instead"), interpret it AS A REFINEMENT of the previous request in this thread — never as a cold literal search. "okay how about vital?" after a bass hunt means "that same bass search, but Vital presets." A follow-up inherits the instrument/vibe/context of what came before unless it clearly changes them.
 - CATEGORY: if the user names an instrument or category (drums, bass, pads, vocals, chords, keys, leads...), your picks MUST be of that category. A follow-up that names NO category inherits the category of the previous turn — "okay how about serum?" after a bass hunt means SERUM BASS presets, not whatever else Serum makes — unless the user names a new one, which replaces it. The candidate list is already weighted toward it. If you include an off-category pick, your reply MUST say why it earns its place ("threw in a pad since it doubles as a bass layer"). Otherwise, stay on-category.
 - picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
-- reply: talk like a producer friend texting back — plain, warm, concrete. Max 3-4 short sentences in 2-3 short paragraphs (blank line between). Say what to DO with the sounds ("layer these two", "pitch this up a bit", "sits right under your vocal") over music theory for its own sake. Skip jargon (modal interchange, voice leading, "relative minor", "pitch-adjust tolerances") UNLESS the user used that kind of language first. No run-on sentences.
-- NEVER mention the [ID] numbers in your reply text. Refer to samples by filename or short descriptor ("the F wub one-shot", "that Cm kick").
+- reply: talk like a producer friend texting back — plain, warm, concrete. Max 3-4 short sentences in 2-3 short paragraphs (blank line between).
+  LEAD WITH THE MOVE, NOT THE REASON. Open with what to DO ("drop this one under the intro", "layer these two"), never with theory. The reason comes second, and only if it earns its place.
+  ASSUME NO THEORY BACKGROUND. A bedroom producer who has never heard "modal", "diatonic", "tonality" or "relative minor" must be able to act on every sentence you write. Say "sounds darker" not "minor tonality"; "sits lower under everything" not "an octave below the root"; "these two sit together" not "they share a key centre". If you name a key or BPM, attach the action to it ("it is in C, so nudge it up to match your project" — not "transpose C -> G").
+  Use a theory term ONLY if the user's own message used that kind of language first. Then match their level and go as deep as they did — a user who asks about modal interchange gets a real answer, not a dumbed-down one.
+  Do NOT wrap filenames or file references in ** or any markdown emphasis. The UI turns file references into interactive chips, and stray asterisks render as literal characters.
+  Short sentences. No run-ons. No lecturing.
+- NEVER mention the [ID] numbers in your reply text. Refer to samples by short descriptor ("the F wub one-shot", "that Cm kick") or by name — whichever reads more naturally. Do not paste long raw filenames into prose.
+- mentions: EVERY time your reply refers to a specific candidate file, add one entry to mentions: the candidate's id, and `text` = the EXACT substring of your reply that names it, copied character-for-character (same spelling, same case, no surrounding punctuation) so it can be located by plain string search. Keep writing naturally — mentions is what lets the UI turn your own words into a play/reveal chip, so you do NOT need to switch to raw filenames to be actionable. Only ids present in the candidate list. If your reply names no specific file, omit mentions.
 - filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
 - category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
 - progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
@@ -92,6 +98,21 @@ SEARCH_TOOL_SCHEMA = {
                         },
                     },
                     "required": ["step", "roman", "chord", "pick_ids"],
+                },
+            },
+            "mentions": {
+                "type": "array",
+                "description": "OPTIONAL — one entry per place the reply text refers to a specific candidate file.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "Candidate id being referred to."},
+                        "text": {
+                            "type": "string",
+                            "description": "The EXACT substring of the reply that names this file, copied character-for-character.",
+                        },
+                    },
+                    "required": ["id", "text"],
                 },
             },
             "filters_used": {
@@ -605,8 +626,10 @@ producer voice, first person, concrete). Rules:
 - Each must be an actionable NEXT step for THIS conversation and song.
 - Plain bedroom-producer language: name the SOUND you'd look for
   ("punchy 140 kick", "warm Rhodes chords"), not music-theory terms.
-  No jargon (modal interchange, voice leading, "relative minor") unless
-  the user's own messages used it first.
+  Assume NO theory background — every suggestion must be typeable by
+  someone who has never heard the words "modal" or "relative minor".
+  Use a theory term ONLY if the user's own messages used it first, and
+  then match their level.
 - Never generic filler; never repeat or trivially rephrase what was just asked.
 - If conversation exists, at least 2 suggestions must build on it.
 Return ONLY the JSON array, no markdown, no explanation."""
@@ -1053,6 +1076,12 @@ def search():
     prog = parsed.get("progression")
     if isinstance(prog, list) and prog:
         out["progression"] = prog
+    # FIX4 item 1 — mentions ride the same optional-passthrough shape as
+    # progression (C11 precedent): present only when the model produced them,
+    # so an older client that ignores the key is unaffected.
+    mentions = parsed.get("mentions")
+    if isinstance(mentions, list) and mentions:
+        out["mentions"] = mentions
     return jsonify(out)
 
 
