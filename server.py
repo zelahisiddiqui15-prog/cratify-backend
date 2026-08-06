@@ -280,25 +280,33 @@ def classify():
     prompt = f"""You are a music file classifier for a producer tool called Cratify.
 
 Analyze this filename and return a JSON object with these fields:
-- category: Bass, Lead, Pad, Pluck, FX, Drum, Vocal, Chord, Arp, Guitar, Piano, Strings, Brass, Synth, Texture, Ambient, or Other.
-- drum_type: ONLY for Drum: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null for non-drums.
+- category: EXACTLY one of: Bass, Chord, Drums, FX, Guitar, Keys, Melody, Pad, Synth, Vocals, Ambient, Other. These exact spellings, including the plurals Drums and Vocals — never Drum, Vocal, Piano, Lead, Pluck, Arp, Strings, Brass, or Texture.
+- instrument: the specific instrument if identifiable (e.g. kick, snare, 808, piano, guitar, violin, flute, vocal), else null.
+- drum_type: ONLY for Drums: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null otherwise.
 - subcategory: more specific description
 - key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
-- bpm: BPM if detectable as number or null
+- bpm: BPM ONLY if a number is visible in the filename, else null. Never guess a tempo.
 - file_type: "stem", "preset", "midi", "sample", or "loop"
 - confidence: 0 to 1
 
 CRITICAL CATEGORY RULES:
-Never use Loop as a standalone category. Instead classify by the instrument type:
-- Drum Loop, Beat, Break → category: Drum (set drum_type: "Full Loop")
+Where the instrument suggests a category outside the list, map it:
+- piano, organ, rhodes, keyboard → Keys
+- strings, brass, orchestral, sax, flute, harp, woodwind → Melody
+- lead, pluck, arp → Synth
+- texture, drone → Ambient
+- any drum or percussion → Drums (plural, always)
+- any vocal, vox, acapella → Vocals (plural, always)
+
+Never use Loop as a standalone category. Classify a loop by its instrument:
+- Drum Loop, Beat, Break → category: Drums (set drum_type: "Full Loop")
 - Bass Loop → category: Bass
-- Synth Loop, Synth Riff → category: Synth
-- Piano Loop → category: Piano
+- Synth Loop, Synth Riff, Lead Loop, Arp Loop → category: Synth
+- Piano Loop → category: Keys
 - Guitar Loop → category: Guitar
 - Chord Loop, Chord Stab → category: Chord
-- Melody Loop, Lead Loop → category: Lead
-- Vocal Loop, Vox Loop → category: Vocal
-- Arp Loop → category: Arp
+- Melody Loop → category: Melody
+- Vocal Loop, Vox Loop → category: Vocals
 - Pad Loop, Atmosphere Loop → category: Pad
 - FX Loop, Riser, Sweep → category: FX
 - Texture Loop, Ambient Loop → category: Ambient
@@ -333,8 +341,10 @@ Return ONLY valid JSON. No markdown, no explanation."""
             "key": None, "bpm": None, "file_type": "stem", "confidence": 0.5
         }
 
-    # Post-process: drums should never have keys
-    if result.get("category") == "Drum":
+    # Post-process: drums should never have keys. Canon spelling is the
+    # PLURAL "Drums"; the singular is checked too so a model slip can never
+    # resurrect the Drum/Drums trap this line once was.
+    if result.get("category") in ("Drum", "Drums"):
         result["key"] = None
     # Force preset category for preset file extensions
     ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
