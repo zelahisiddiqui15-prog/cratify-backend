@@ -88,10 +88,10 @@ def username_exists(username):
     conn.close()
     return exists
 
-def increment_sorts(user_id):
+def increment_sorts(user_id, count=1):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET sorts_used = sorts_used + 1 WHERE id = %s", (user_id,))
+    cur.execute("UPDATE users SET sorts_used = sorts_used + %s WHERE id = %s", (count, user_id))
     conn.commit()
     cur.close()
     conn.close()

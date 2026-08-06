@@ -22,6 +22,78 @@ load_dotenv()
 # stable prefix hoisted to module level: it must be a byte-stable prefix
 # for prompt caching to have anything to match on.
 SMALL_MODEL = "claude-haiku-4-5-20251001"
+
+# AI-OPT: models the batch endpoint may be asked to use — an allow-list so
+# the API can never be pointed at an expensive model by a caller.
+ALLOWED_CLASSIFY_MODELS = {
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+}
+
+# Shared by /classify and /classify_batch — one source of truth so the two
+# endpoints can never drift apart in vocabulary (the singular/plural traps
+# were born from exactly that kind of duplication).
+CLASSIFY_RULES = """You are a music file classifier for a producer tool called Cratify.
+
+Analyze each filename and return a JSON object with these fields:
+- category: EXACTLY one of: Bass, Chord, Drums, FX, Guitar, Keys, Melody, Pad, Synth, Vocals, Ambient, Other. These exact spellings, including the plurals Drums and Vocals — never Drum, Vocal, Piano, Lead, Pluck, Arp, Strings, Brass, or Texture.
+- instrument: EXACTLY one of (these spellings, capitalized): 808, Acapella, Adlib, Ambient, Arp, Atmosphere, Bass, Brass, Cello, Chop, Chord, Clap, Clarinet, Cymbal, Downlifter, Drums, FX, Flute, Guitar, Guitar Acoustic, Guitar Electric, Harp, Hat, Horn, Impact, Keys, Kick, Lead, Loop, Melody, Oboe, Organ, Other, Pad, Percussion, Piano, Pluck, Reese, Rhodes, Rim, Riser, Saw, Sax, Shaker, Snare, Strings, Sub, Sweep, Synth, Texture, Tom, Transition, Trombone, Trumpet, Viola, Violin, Vocals, Wurli. Null if none fits.
+- drum_type: ONLY for Drums: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null otherwise.
+- subcategory: more specific description
+- key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
+- bpm: BPM ONLY if a number is visible in the filename, else null. Never guess a tempo.
+- file_type: "stem", "preset", "midi", "sample", or "loop"
+- confidence: 0 to 1
+
+CRITICAL CATEGORY RULES:
+Where the instrument suggests a category outside the list, map it:
+- piano, organ, rhodes, keyboard → Keys
+- strings, brass, orchestral, sax, flute, harp, woodwind → Melody
+- lead, pluck, arp → Synth
+- texture, drone → Ambient
+- any drum or percussion → Drums (plural, always)
+- any vocal, vox, acapella → Vocals (plural, always)
+
+Never use Loop as a standalone category. Classify a loop by its instrument:
+- Drum Loop, Beat, Break → category: Drums (set drum_type: "Full Loop")
+- Bass Loop → category: Bass
+- Synth Loop, Synth Riff, Lead Loop, Arp Loop → category: Synth
+- Piano Loop → category: Keys
+- Guitar Loop → category: Guitar
+- Chord Loop, Chord Stab → category: Chord
+- Melody Loop → category: Melody
+- Vocal Loop, Vox Loop → category: Vocals
+- Pad Loop, Atmosphere Loop → category: Pad
+- FX Loop, Riser, Sweep → category: FX
+- Texture Loop, Ambient Loop → category: Ambient
+- If a loop's instrument is truly unknown: category: Other
+
+Set file_type to "loop" whenever the filename contains "loop", "lp", "riff", "break", or "beat".
+
+"""
+
+FALLBACK_RESULT = {
+    "category": "Other", "instrument": None, "drum_type": None,
+    "subcategory": "Unknown", "key": None, "bpm": None,
+    "file_type": "sample", "confidence": 0.3,
+}
+
+
+def postprocess_result(result, filename):
+    """Per-file post-processing shared by both classify endpoints."""
+    if result.get("category") in ("Drum", "Drums"):
+        result["key"] = None
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext in ("fxp", "vital", "nmsv", "xpf", "aupreset", "patch"):
+        # AI-OPT fix: file_type is forced, the CATEGORY the model chose
+        # stands. The old code forced category='Preset', which is not in
+        # the 13-canon — the client guard coerced it to 'Other' and the
+        # model's real answer was destroyed for every preset file.
+        result["file_type"] = "preset"
+        result["key"] = None
+        result["bpm"] = None
+    return result
 # PRICING WATCH, dated 2026-07-28 (Gate BE1). Staying on claude-sonnet-4-6
 # is a MEASURED choice, not inertia. claude-sonnet-5 is $2/$10 per MTok on
 # introductory pricing through 2026-08-31, then $3/$15 — the same sticker as
@@ -277,46 +349,10 @@ def classify():
         if user["sorts_used"] >= user["trial_limit"]:
             return jsonify({"error": "trial_exhausted"}), 402
 
-    prompt = f"""You are a music file classifier for a producer tool called Cratify.
-
-Analyze this filename and return a JSON object with these fields:
-- category: EXACTLY one of: Bass, Chord, Drums, FX, Guitar, Keys, Melody, Pad, Synth, Vocals, Ambient, Other. These exact spellings, including the plurals Drums and Vocals — never Drum, Vocal, Piano, Lead, Pluck, Arp, Strings, Brass, or Texture.
-- instrument: EXACTLY one of (these spellings, capitalized): 808, Acapella, Adlib, Ambient, Arp, Atmosphere, Bass, Brass, Cello, Chop, Chord, Clap, Clarinet, Cymbal, Downlifter, Drums, FX, Flute, Guitar, Guitar Acoustic, Guitar Electric, Harp, Hat, Horn, Impact, Keys, Kick, Lead, Loop, Melody, Oboe, Organ, Other, Pad, Percussion, Piano, Pluck, Reese, Rhodes, Rim, Riser, Saw, Sax, Shaker, Snare, Strings, Sub, Sweep, Synth, Texture, Tom, Transition, Trombone, Trumpet, Viola, Violin, Vocals, Wurli. Null if none fits.
-- drum_type: ONLY for Drums: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null otherwise.
-- subcategory: more specific description
-- key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
-- bpm: BPM ONLY if a number is visible in the filename, else null. Never guess a tempo.
-- file_type: "stem", "preset", "midi", "sample", or "loop"
-- confidence: 0 to 1
-
-CRITICAL CATEGORY RULES:
-Where the instrument suggests a category outside the list, map it:
-- piano, organ, rhodes, keyboard → Keys
-- strings, brass, orchestral, sax, flute, harp, woodwind → Melody
-- lead, pluck, arp → Synth
-- texture, drone → Ambient
-- any drum or percussion → Drums (plural, always)
-- any vocal, vox, acapella → Vocals (plural, always)
-
-Never use Loop as a standalone category. Classify a loop by its instrument:
-- Drum Loop, Beat, Break → category: Drums (set drum_type: "Full Loop")
-- Bass Loop → category: Bass
-- Synth Loop, Synth Riff, Lead Loop, Arp Loop → category: Synth
-- Piano Loop → category: Keys
-- Guitar Loop → category: Guitar
-- Chord Loop, Chord Stab → category: Chord
-- Melody Loop → category: Melody
-- Vocal Loop, Vox Loop → category: Vocals
-- Pad Loop, Atmosphere Loop → category: Pad
-- FX Loop, Riser, Sweep → category: FX
-- Texture Loop, Ambient Loop → category: Ambient
-- If a loop's instrument is truly unknown: category: Other
-
-Set file_type to "loop" whenever the filename contains "loop", "lp", "riff", "break", or "beat".
-
-Filename: {filename}
+    prompt = CLASSIFY_RULES + f"""Filename: {filename}
 
 Return ONLY valid JSON. No markdown, no explanation."""
+
 
     try:
         message = anthropic_client.messages.create(
@@ -341,20 +377,90 @@ Return ONLY valid JSON. No markdown, no explanation."""
             "key": None, "bpm": None, "file_type": "stem", "confidence": 0.5
         }
 
-    # Post-process: drums should never have keys. Canon spelling is the
-    # PLURAL "Drums"; the singular is checked too so a model slip can never
-    # resurrect the Drum/Drums trap this line once was.
-    if result.get("category") in ("Drum", "Drums"):
-        result["key"] = None
-    # Force preset category for preset file extensions
-    ext = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
-    if ext in ('fxp', 'vital', 'nmsv', 'xpf', 'aupreset', 'patch'):
-        result['category'] = 'Preset'
-        result['key'] = None
-        result['bpm'] = None
-        result['file_type'] = 'preset'
+    result = postprocess_result(result, filename)
     increment_sorts(user_id)
     return jsonify(result)
+
+
+@app.route("/classify_batch", methods=["POST"])
+def classify_batch():
+    """AI-OPT — N filenames per call, one metered sort each.
+
+    The ~700-token rule prompt is paid once per CALL, so a batch of 25
+    amortises the expensive part ~25x. Fail-soft contract: a malformed
+    ITEM becomes the honest low-confidence fallback for that item only; a
+    malformed WHOLE RESPONSE is a 502 and the client falls back to
+    singles for that batch — one bad answer never costs the other 24.
+    """
+    data = request.json or {}
+    filenames = data.get("filenames")
+    user_id = data.get("user_id")
+    if not isinstance(filenames, list) or not filenames or not user_id:
+        return jsonify({"error": "filenames (list) and user_id required"}), 400
+    if len(filenames) > 50:
+        return jsonify({"error": "max 50 filenames per call"}), 400
+    if not all(isinstance(f, str) and f for f in filenames):
+        return jsonify({"error": "filenames must be non-empty strings"}), 400
+
+    user = get_user(user_id)
+    if not user:
+        return jsonify({"error": "user not found"}), 404
+    if not user["subscription_active"]:
+        if user["sorts_used"] + len(filenames) > user["trial_limit"]:
+            return jsonify({"error": "trial_exhausted"}), 402
+
+    model = data.get("model") or SMALL_MODEL
+    if model not in ALLOWED_CLASSIFY_MODELS:
+        return jsonify({"error": "model not allowed"}), 400
+
+    listing = "\n".join(f"{i + 1}. {fn}" for i, fn in enumerate(filenames))
+    prompt = CLASSIFY_RULES + (
+        f"You will be given {len(filenames)} filenames. Return ONLY a JSON "
+        f"array of exactly {len(filenames)} objects, one per filename IN "
+        f"ORDER, each with the fields above.\n\nFilenames:\n{listing}\n\n"
+        "Return ONLY the JSON array. No markdown, no explanation."
+    )
+
+    try:
+        message = anthropic_client.messages.create(
+            model=model,
+            max_tokens=128 + 90 * len(filenames),
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as api_err:
+        print(f"[classify_batch] Anthropic API error: {api_err}", flush=True)
+        return jsonify({"error": str(api_err)}), 500
+
+    raw = message.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    try:
+        parsed = json.loads(raw.strip())
+        if not isinstance(parsed, list) or len(parsed) != len(filenames):
+            raise ValueError(f"expected {len(filenames)} items, got "
+                             f"{len(parsed) if isinstance(parsed, list) else type(parsed)}")
+    except Exception as parse_err:
+        # Whole-response failure: bill nothing, client retries as singles.
+        print(f"[classify_batch] parse failure: {parse_err}", flush=True)
+        return jsonify({"error": "batch_parse_failed"}), 502
+
+    results = []
+    for fn, item in zip(filenames, parsed):
+        if not isinstance(item, dict) or not item.get("category"):
+            item = dict(FALLBACK_RESULT)   # per-item fail-soft
+        results.append(postprocess_result(item, fn))
+
+    increment_sorts(user_id, len(filenames))
+    return jsonify({
+        "results": results,
+        "model": model,
+        "usage": {
+            "input_tokens": message.usage.input_tokens,
+            "output_tokens": message.usage.output_tokens,
+        },
+    })
 
 
 @app.route("/classify_preset", methods=["POST"])
