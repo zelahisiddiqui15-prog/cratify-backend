@@ -139,7 +139,7 @@ Guidelines for your response:
 - mentions (REQUIRED FIELD): for EVERY file reference in your reply, add {id, text} where `text` is the EXACT substring of your reply naming it, copied character-for-character — same spelling, same case, no trailing punctuation — so it can be found by plain string search. If your reply mentions three files, mentions has three entries. This is what turns your words into play/reveal buttons; a reference with no mentions entry is dead text to the user. Only ids from the candidate list. If the reply genuinely names no file, return an empty array.
   EACH `text` SPAN MUST BE UNIQUE WITHIN THE REPLY. The span is found by plain string search, so two mentions sharing the same wording are indistinguishable — one file silently stands in for both and the user cannot tell which one they are hearing. If you want to point at two files that would naturally share a phrase ("the Au5 dub kicks"), either name them distinctly ("the first Au5 dub kick" / "the second Au5 dub kick") or refer to only one of them. Never emit two mentions with identical `text`.
 - filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
-- category MUST be one of: Drums, Bass, Synth, Leads, Vocals, FX, Loops, One-Shots, Keys, Percussion, Other
+- category MUST be one of the library's real category values: Ambient, Bass, Chord, Drums, FX, Guitar, Keys, Melody, Other, Pad, Synth, Vocals. These are the values files actually carry — any other word makes the 'see more' filter match nothing.
 - progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
 
 You MUST respond by calling the return_search_results tool. Do not respond with text.
@@ -207,7 +207,14 @@ SEARCH_TOOL_SCHEMA = {
                 "type": "object",
                 "description": "Broader filter criteria the user might want (for 'see more' button).",
                 "properties": {
-                    "category": {"type": "string"},
+                    # CANON1 follow-up: enum enforces the canon the DB
+                    # actually contains — the old free string let the model
+                    # emit 'Leads'/'Loops'/'One-Shots', values no files row
+                    # has ever held, so the see-more filter matched nothing.
+                    "category": {"type": "string", "enum": [
+                        "Ambient", "Bass", "Chord", "Drums", "FX", "Guitar",
+                        "Keys", "Melody", "Other", "Pad", "Synth", "Vocals",
+                    ]},
                     "key": {"type": "string"},
                     "bpm_min": {"type": "integer"},
                     "bpm_max": {"type": "integer"},
