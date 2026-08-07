@@ -35,6 +35,38 @@ SMALL_MODEL = "claude-haiku-4-5-20251001"
 # trial — the trial gate meters user-initiated actions only.
 EMBED_MONTHLY_LIMIT = 30000
 CLASSIFY_MONTHLY_LIMIT = 10000
+# METER2 ceilings — recurring-use endpoints. The client's $5/week budget
+# is the throttle an honest user feels; these are the abuse backstop and
+# sit strictly ABOVE honest heavy use so the two limits never disagree
+# in practice (server >> client-implied volume):
+#   search    2,000/mo  (~$30-40 max; $5/wk client cap implies ~1,400/mo)
+#   suggest   3,000/mo  (~$9 max; auto-fires on chat open — S6 leaked twice)
+#   describe    500/mo  (~$10 max; one call per attached reference)
+#   intent    2,000/mo  (tiny Haiku; legacy caller only)
+#   summarize   200/mo  (rare user action; legacy caller only)
+SEARCH_MONTHLY_LIMIT = 2000
+SUGGEST_MONTHLY_LIMIT = 3000
+DESCRIBE_MONTHLY_LIMIT = 500
+INTENT_MONTHLY_LIMIT = 2000
+SUMMARIZE_MONTHLY_LIMIT = 200
+
+
+def meter_gate(data, kind, counter_field, limit, count=1):
+    """METER2 — the one shape every spending endpoint uses: identity
+    required (400/404), ceiling checked BEFORE spend (429 monthly_limit),
+    counting done by the caller AFTER success. Returns (error_response,
+    status, user_id); error_response is None when the call may proceed."""
+    user_id = (data or {}).get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400, None
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404, None
+    used = get_usage(user_id).get(counter_field, 0) or 0
+    if used + count > limit:
+        return jsonify({"error": "monthly_limit", "kind": kind,
+                        "used": used, "limit": limit,
+                        "month": month_key()}), 429, None
+    return None, 200, user_id
 
 # AI-OPT: models the batch endpoint may be asked to use — an allow-list so
 # the API can never be pointed at an expensive model by a caller.
@@ -605,6 +637,7 @@ def classify_preset():
     confidence = float(parsed.get("confidence") or 0.5)
 
     increment_sorts(user_id)
+    add_usage(user_id, classify_int=1)
 
     return jsonify({
         "preset_category": preset_category,
@@ -770,6 +803,11 @@ def suggest_prompts():
     could send NEXT — actionable for THIS conversation and THIS song,
     never generic, never repeating what was just asked."""
     data = request.json or {}
+    # METER2 — auto-fires on chat open; this endpoint has leaked spend
+    # twice (S6). Identity + ceiling, counted per successful model call.
+    err, code, _sg_uid = meter_gate(data, "suggest", "suggest_count", SUGGEST_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
     context_block = data.get("context_block") or ""
     messages = data.get("messages") or []
     sketch = data.get("library_sketch") or ""
@@ -826,6 +864,7 @@ Return ONLY the JSON array, no markdown, no explanation."""
         prompts = [str(x).strip() for x in prompts if str(x).strip()][:4]
         if not prompts:
             raise ValueError("empty")
+        add_usage(_sg_uid, suggest=1)
         return jsonify({"prompts": prompts})
     except Exception as api_err:
         print(f"[suggest_prompts] error: {api_err}", flush=True)
@@ -840,6 +879,9 @@ def describe_reference():
     edit is the correction layer), and the read is CHARACTER context
     only: the project's own key/BPM govern matching client-side."""
     data = request.json or {}
+    err, code, _dr_uid = meter_gate(data, "describe", "describe_count", DESCRIBE_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
     features_text = data.get("features_text")
     if not features_text or not isinstance(features_text, str):
         return jsonify({"error": "features_text required"}), 400
@@ -863,6 +905,7 @@ description text, no preamble."""
             messages=[{"role": "user", "content": prompt}]
         )
         read = message.content[0].text.strip()
+        add_usage(_dr_uid, describe=1)
         return jsonify({"read": read})
     except Exception as api_err:
         print(f"[describe_reference] Anthropic API error: {api_err}", flush=True)
@@ -873,6 +916,9 @@ description text, no preamble."""
 def intent():
     """Parse a chat message for bulk file action intent using Claude Haiku."""
     data = request.json or {}
+    err, code, _in_uid = meter_gate(data, "intent", "intent_count", INTENT_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
     message = data.get("message", "").strip()
     if not message:
         return jsonify({"action": None})
@@ -892,6 +938,7 @@ def intent():
         # Normalise: always return the top-level action key
         if "action" not in result:
             result["action"] = None
+        add_usage(_in_uid, intent=1)
         return jsonify(result)
     except Exception as e:
         print(f"[/intent] error: {e}", flush=True)
@@ -1000,8 +1047,15 @@ def usage():
         "classify_int_count": u["classify_int_count"],
         "library_size": u["library_size"],
         "search_count": u.get("search_count", 0),
+        "describe_count": u.get("describe_count", 0),
+        "suggest_count": u.get("suggest_count", 0),
+        "intent_count": u.get("intent_count", 0),
+        "summarize_count": u.get("summarize_count", 0),
         "first_library_size": (get_user(user_id) or {}).get("first_library_size"),
-        "limits": {"embed": EMBED_MONTHLY_LIMIT, "classify": CLASSIFY_MONTHLY_LIMIT},
+        "limits": {"embed": EMBED_MONTHLY_LIMIT, "classify": CLASSIFY_MONTHLY_LIMIT,
+                   "search": SEARCH_MONTHLY_LIMIT, "suggest": SUGGEST_MONTHLY_LIMIT,
+                   "describe": DESCRIBE_MONTHLY_LIMIT, "intent": INTENT_MONTHLY_LIMIT,
+                   "summarize": SUMMARIZE_MONTHLY_LIMIT},
         "embed_paused": u["embed_count"] >= EMBED_MONTHLY_LIMIT,
         "classify_paused": u["classify_bg_count"] >= CLASSIFY_MONTHLY_LIMIT,
     })
@@ -1094,6 +1148,9 @@ def summarize_project():
     Cost: ~$0.0015 per call (Haiku 4.5).
     """
     data = request.get_json(force=True) or {}
+    err, code, _sp_uid = meter_gate(data, "summarize", "summarize_count", SUMMARIZE_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
     notes = (data.get("notes") or "").strip()
     messages = data.get("messages", [])
 
@@ -1198,6 +1255,7 @@ Generate the 1-liner."""
         summary = summary[:77] + "..."
 
     print(f"[summarize_project] summary: {summary!r}", flush=True)
+    add_usage(_sp_uid, summarize=1)
     return jsonify({"summary": summary})
 
 
@@ -1207,12 +1265,11 @@ def search():
     Claude re-ranks, writes an explanation, and returns structured filters."""
     data = request.get_json(force=True) or {}
     query = (data.get("query") or "").strip()
-    # METER1b — instrumentation only: interactive searches per user per
-    # month. Optional user_id (older clients omit it); NOT a gate — the
-    # metering of /search itself remains the recorded pre-launch blocker.
-    _search_uid = data.get("user_id")
-    if _search_uid and get_user(_search_uid):
-        add_usage(_search_uid, search=1)
+    # METER2 — the expensive endpoint (Sonnet), now closed: identity
+    # required, monthly ceiling checked before any spend.
+    err, code, _search_uid = meter_gate(data, "search", "search_count", SEARCH_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
     candidates = data.get("candidates", [])
     conversation = data.get("conversation", [])
 
@@ -1288,6 +1345,7 @@ def search():
         "cache_read_input_tokens": getattr(_u, "cache_read_input_tokens", 0) or 0,
     }
     print(f"[search] usage {usage_out}", flush=True)
+    add_usage(_search_uid, search=1)
 
     if tool_use is None:
         print(f"[search] no tool_use block returned. Content: {response.content}", flush=True)
