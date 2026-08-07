@@ -49,6 +49,12 @@ def init_db():
         )
     """)
     cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS search_count INTEGER DEFAULT 0")
+    # METER2 — one counter per spending endpoint. No endpoint spends
+    # without knowing who asked, and every ask is counted.
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS describe_count INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS suggest_count INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS intent_count INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS summarize_count INTEGER DEFAULT 0")
     # METER1b -- first-index library size, set once, on users: the growth
     # baseline. usage_monthly.library_size is the per-month time series.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_library_size INTEGER")
@@ -134,10 +140,13 @@ def get_usage(user_id, month=None):
         "user_id": user_id, "month": month or month_key(),
         "embed_count": 0, "classify_bg_count": 0,
         "classify_int_count": 0, "library_size": None,
+        "search_count": 0, "describe_count": 0, "suggest_count": 0,
+        "intent_count": 0, "summarize_count": 0,
     }
 
 
-def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None, search=0):
+def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None, search=0,
+              describe=0, suggest=0, intent=0, summarize=0):
     """Upsert-increment the month's counters. Instrumentation counts
     EVERYTHING — capped or not, background or interactive — because the
     point of deferring pricing is producing this data."""
@@ -146,18 +155,25 @@ def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None
     cur.execute(
         """
         INSERT INTO usage_monthly (user_id, month, embed_count, classify_bg_count,
-                                   classify_int_count, library_size, search_count, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                   classify_int_count, library_size, search_count,
+                                   describe_count, suggest_count, intent_count,
+                                   summarize_count, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id, month) DO UPDATE SET
             embed_count = usage_monthly.embed_count + EXCLUDED.embed_count,
             classify_bg_count = usage_monthly.classify_bg_count + EXCLUDED.classify_bg_count,
             classify_int_count = usage_monthly.classify_int_count + EXCLUDED.classify_int_count,
             library_size = COALESCE(EXCLUDED.library_size, usage_monthly.library_size),
             search_count = usage_monthly.search_count + EXCLUDED.search_count,
+            describe_count = usage_monthly.describe_count + EXCLUDED.describe_count,
+            suggest_count = usage_monthly.suggest_count + EXCLUDED.suggest_count,
+            intent_count = usage_monthly.intent_count + EXCLUDED.intent_count,
+            summarize_count = usage_monthly.summarize_count + EXCLUDED.summarize_count,
             updated_at = EXCLUDED.updated_at
         """,
         (user_id, month_key(), embed, classify_bg, classify_int,
-         library_size, search, datetime.utcnow().isoformat()),
+         library_size, search, describe, suggest, intent, summarize,
+         datetime.utcnow().isoformat()),
     )
     if library_size is not None:
         cur.execute(
