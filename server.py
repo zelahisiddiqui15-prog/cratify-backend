@@ -999,6 +999,8 @@ def usage():
         "classify_bg_count": u["classify_bg_count"],
         "classify_int_count": u["classify_int_count"],
         "library_size": u["library_size"],
+        "search_count": u.get("search_count", 0),
+        "first_library_size": (get_user(user_id) or {}).get("first_library_size"),
         "limits": {"embed": EMBED_MONTHLY_LIMIT, "classify": CLASSIFY_MONTHLY_LIMIT},
         "embed_paused": u["embed_count"] >= EMBED_MONTHLY_LIMIT,
         "classify_paused": u["classify_bg_count"] >= CLASSIFY_MONTHLY_LIMIT,
@@ -1205,6 +1207,12 @@ def search():
     Claude re-ranks, writes an explanation, and returns structured filters."""
     data = request.get_json(force=True) or {}
     query = (data.get("query") or "").strip()
+    # METER1b — instrumentation only: interactive searches per user per
+    # month. Optional user_id (older clients omit it); NOT a gate — the
+    # metering of /search itself remains the recorded pre-launch blocker.
+    _search_uid = data.get("user_id")
+    if _search_uid and get_user(_search_uid):
+        add_usage(_search_uid, search=1)
     candidates = data.get("candidates", [])
     conversation = data.get("conversation", [])
 

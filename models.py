@@ -43,10 +43,15 @@ def init_db():
             classify_bg_count INTEGER DEFAULT 0,
             classify_int_count INTEGER DEFAULT 0,
             library_size INTEGER,
+            search_count INTEGER DEFAULT 0,
             updated_at TEXT,
             PRIMARY KEY (user_id, month)
         )
     """)
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS search_count INTEGER DEFAULT 0")
+    # METER1b -- first-index library size, set once, on users: the growth
+    # baseline. usage_monthly.library_size is the per-month time series.
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_library_size INTEGER")
     conn.commit()
     cur.close()
     conn.close()
@@ -132,7 +137,7 @@ def get_usage(user_id, month=None):
     }
 
 
-def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None):
+def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None, search=0):
     """Upsert-increment the month's counters. Instrumentation counts
     EVERYTHING — capped or not, background or interactive — because the
     point of deferring pricing is producing this data."""
@@ -141,18 +146,24 @@ def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None
     cur.execute(
         """
         INSERT INTO usage_monthly (user_id, month, embed_count, classify_bg_count,
-                                   classify_int_count, library_size, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                   classify_int_count, library_size, search_count, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id, month) DO UPDATE SET
             embed_count = usage_monthly.embed_count + EXCLUDED.embed_count,
             classify_bg_count = usage_monthly.classify_bg_count + EXCLUDED.classify_bg_count,
             classify_int_count = usage_monthly.classify_int_count + EXCLUDED.classify_int_count,
             library_size = COALESCE(EXCLUDED.library_size, usage_monthly.library_size),
+            search_count = usage_monthly.search_count + EXCLUDED.search_count,
             updated_at = EXCLUDED.updated_at
         """,
         (user_id, month_key(), embed, classify_bg, classify_int,
-         library_size, datetime.utcnow().isoformat()),
+         library_size, search, datetime.utcnow().isoformat()),
     )
+    if library_size is not None:
+        cur.execute(
+            "UPDATE users SET first_library_size = COALESCE(first_library_size, %s) WHERE id = %s",
+            (library_size, user_id),
+        )
     conn.commit()
     cur.close()
     conn.close()
