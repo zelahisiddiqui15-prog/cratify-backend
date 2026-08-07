@@ -39,7 +39,7 @@ CLASSIFY_RULES = """You are a music file classifier for a producer tool called C
 Analyze each filename and return a JSON object with these fields:
 - category: EXACTLY one of: Bass, Chord, Drums, FX, Guitar, Keys, Melody, Pad, Synth, Vocals, Ambient, Other. These exact spellings, including the plurals Drums and Vocals — never Drum, Vocal, Piano, Lead, Pluck, Arp, Strings, Brass, or Texture.
 - instrument: EXACTLY one of (these spellings, capitalized): 808, Acapella, Adlib, Ambient, Arp, Atmosphere, Bass, Brass, Cello, Chop, Chord, Clap, Clarinet, Cymbal, Downlifter, Drums, FX, Flute, Guitar, Guitar Acoustic, Guitar Electric, Harp, Hat, Horn, Impact, Keys, Kick, Lead, Loop, Melody, Oboe, Organ, Other, Pad, Percussion, Piano, Pluck, Reese, Rhodes, Rim, Riser, Saw, Sax, Shaker, Snare, Strings, Sub, Sweep, Synth, Texture, Tom, Transition, Trombone, Trumpet, Viola, Violin, Vocals, Wurli. Null if none fits.
-- drum_type: ONLY for Drums: Kick, Snare, Hi-Hat, Clap, Perc, Cymbal, Tom, Full Loop. Null otherwise.
+- drum_type: ONLY for Drums, EXACTLY one of: Kick, Snare, Hat, Clap, Percussion, Cymbal, Tom, Rim, Shaker. These spellings — never Hi-Hat, Perc, or Full Loop. Null otherwise.
 - subcategory: more specific description
 - key: musical key if detectable (e.g. "Am", "C#") or null. Always null for drums.
 - bpm: BPM ONLY if a number is visible in the filename, else null. Never guess a tempo.
@@ -56,7 +56,7 @@ Where the instrument suggests a category outside the list, map it:
 - any vocal, vox, acapella → Vocals (plural, always)
 
 Never use Loop as a standalone category. Classify a loop by its instrument:
-- Drum Loop, Beat, Break → category: Drums (set drum_type: "Full Loop")
+- Drum Loop, Beat, Break → category: Drums (drum_type: null — it is a whole loop, not one drum)
 - Bass Loop → category: Bass
 - Synth Loop, Synth Riff, Lead Loop, Arp Loop → category: Synth
 - Piano Loop → category: Keys
