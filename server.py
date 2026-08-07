@@ -14,6 +14,7 @@ EMBED_DIMENSION = 512
 from models import (init_db, create_user, get_user, get_user_by_email,
                     get_user_by_username, username_exists, get_db,
                     increment_sorts, activate_subscription,
+                    get_usage, add_usage, month_key,
                     deactivate_subscription, set_stripe_customer, hash_password)
 
 load_dotenv()
@@ -22,6 +23,18 @@ load_dotenv()
 # stable prefix hoisted to module level: it must be a byte-stable prefix
 # for prompt caching to have anything to match on.
 SMALL_MODEL = "claude-haiku-4-5-20251001"
+
+# ── METER1: monthly ceilings for BACKGROUND work ─────────────────────────
+# RECOMMENDED NUMBERS (Zee approves before deploy — see the gate report):
+#   EMBED_MONTHLY_LIMIT    30,000/user/month  ≈ $3.00 max COGS (Voyage)
+#   CLASSIFY_MONTHLY_LIMIT 10,000/user/month  ≈ $4.50 max COGS (Haiku)
+# Rationale: one full index of a 30k-file library per month, with the
+# classify share sized to the measured ~1/3 of files that reach tier 5.
+# Typical cost is far lower (indexing is one-time); the cap bounds abuse
+# and runaway clients, not honest use. Background work does NOT touch the
+# trial — the trial gate meters user-initiated actions only.
+EMBED_MONTHLY_LIMIT = 30000
+CLASSIFY_MONTHLY_LIMIT = 10000
 
 # AI-OPT: models the batch endpoint may be asked to use — an allow-list so
 # the API can never be pointed at an expensive model by a caller.
@@ -352,7 +365,16 @@ def classify():
     if not user:
         return jsonify({"error": "user not found"}), 404
 
-    if not user["subscription_active"]:
+    # METER1 — background work is exempt from the trial (the gate was
+    # written for user-initiated actions) but answers to a monthly ceiling.
+    source = data.get("source", "interactive")
+    if source == "background":
+        used = get_usage(user_id)["classify_bg_count"]
+        if used + 1 > CLASSIFY_MONTHLY_LIMIT:
+            return jsonify({"error": "monthly_limit", "kind": "classify",
+                            "used": used, "limit": CLASSIFY_MONTHLY_LIMIT,
+                            "month": month_key()}), 429
+    elif not user["subscription_active"]:
         if user["sorts_used"] >= user["trial_limit"]:
             return jsonify({"error": "trial_exhausted"}), 402
 
@@ -385,7 +407,11 @@ Return ONLY valid JSON. No markdown, no explanation."""
         }
 
     result = postprocess_result(result, filename)
-    increment_sorts(user_id)
+    if source == "background":
+        add_usage(user_id, classify_bg=1)
+    else:
+        increment_sorts(user_id)
+        add_usage(user_id, classify_int=1)
     return jsonify(result)
 
 
@@ -412,7 +438,14 @@ def classify_batch():
     user = get_user(user_id)
     if not user:
         return jsonify({"error": "user not found"}), 404
-    if not user["subscription_active"]:
+    source = data.get("source", "interactive")
+    if source == "background":
+        used = get_usage(user_id)["classify_bg_count"]
+        if used + len(filenames) > CLASSIFY_MONTHLY_LIMIT:
+            return jsonify({"error": "monthly_limit", "kind": "classify",
+                            "used": used, "limit": CLASSIFY_MONTHLY_LIMIT,
+                            "month": month_key()}), 429
+    elif not user["subscription_active"]:
         if user["sorts_used"] + len(filenames) > user["trial_limit"]:
             return jsonify({"error": "trial_exhausted"}), 402
 
@@ -459,7 +492,11 @@ def classify_batch():
             item = dict(FALLBACK_RESULT)   # per-item fail-soft
         results.append(postprocess_result(item, fn))
 
-    increment_sorts(user_id, len(filenames))
+    if source == "background":
+        add_usage(user_id, classify_bg=len(filenames))
+    else:
+        increment_sorts(user_id, len(filenames))
+        add_usage(user_id, classify_int=len(filenames))
     return jsonify({
         "results": results,
         "model": model,
@@ -946,6 +983,43 @@ def pair():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/usage", methods=["GET"])
+def usage():
+    """METER1 — the honest-state surface: what this user has spent this
+    month, against which limits, so the app can SAY when work is paused."""
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404
+    u = get_usage(user_id)
+    return jsonify({
+        "month": u["month"],
+        "embed_count": u["embed_count"],
+        "classify_bg_count": u["classify_bg_count"],
+        "classify_int_count": u["classify_int_count"],
+        "library_size": u["library_size"],
+        "limits": {"embed": EMBED_MONTHLY_LIMIT, "classify": CLASSIFY_MONTHLY_LIMIT},
+        "embed_paused": u["embed_count"] >= EMBED_MONTHLY_LIMIT,
+        "classify_paused": u["classify_bg_count"] >= CLASSIFY_MONTHLY_LIMIT,
+    })
+
+
+@app.route("/usage/report", methods=["POST"])
+def usage_report():
+    """Client reports library size after a scan — the third axis the
+    pricing decision needs (spend means nothing without library size)."""
+    data = request.json or {}
+    user_id = data.get("user_id")
+    size = data.get("library_size")
+    if not user_id or not isinstance(size, int) or size < 0:
+        return jsonify({"error": "user_id and library_size (int) required"}), 400
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404
+    add_usage(user_id, library_size=size)
+    return jsonify({"ok": True})
+
+
 @app.route("/embed", methods=["POST"])
 def embed():
     """Generate text embeddings via Voyage AI for semantic search."""
@@ -955,6 +1029,20 @@ def embed():
 
     if not texts:
         return jsonify({"embeddings": []})
+
+    # METER1 — /embed had NO identity and NO ceiling: an anonymous Voyage
+    # proxy whose cost was bounded only by a client-side setting. Identity
+    # is now required and the monthly ceiling is checked BEFORE any spend.
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404
+    used = get_usage(user_id)["embed_count"]
+    if used + len(texts) > EMBED_MONTHLY_LIMIT:
+        return jsonify({"error": "monthly_limit", "kind": "embed",
+                        "used": used, "limit": EMBED_MONTHLY_LIMIT,
+                        "month": month_key()}), 429
 
     BATCH = 128
     all_embeddings = []
@@ -972,6 +1060,7 @@ def embed():
             print(f"[embed] chunk {i} failed: {e}", flush=True)
             return jsonify({"error": str(e)}), 500
 
+    add_usage(user_id, embed=len(texts))
     return jsonify({
         "embeddings": all_embeddings,
         "model": EMBED_MODEL,

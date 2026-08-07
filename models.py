@@ -33,6 +33,20 @@ def init_db():
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT UNIQUE")
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+    # METER1 — per-user, per-month usage: the instrumentation a pricing
+    # decision actually needs, and the ledger the ceilings check against.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS usage_monthly (
+            user_id TEXT NOT NULL,
+            month TEXT NOT NULL,
+            embed_count INTEGER DEFAULT 0,
+            classify_bg_count INTEGER DEFAULT 0,
+            classify_int_count INTEGER DEFAULT 0,
+            library_size INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (user_id, month)
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -95,6 +109,54 @@ def increment_sorts(user_id, count=1):
     conn.commit()
     cur.close()
     conn.close()
+
+def month_key():
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def get_usage(user_id, month=None):
+    """Current-month usage row, zeros if none yet."""
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(
+        "SELECT * FROM usage_monthly WHERE user_id = %s AND month = %s",
+        (user_id, month or month_key()),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return dict(row) if row else {
+        "user_id": user_id, "month": month or month_key(),
+        "embed_count": 0, "classify_bg_count": 0,
+        "classify_int_count": 0, "library_size": None,
+    }
+
+
+def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None):
+    """Upsert-increment the month's counters. Instrumentation counts
+    EVERYTHING — capped or not, background or interactive — because the
+    point of deferring pricing is producing this data."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO usage_monthly (user_id, month, embed_count, classify_bg_count,
+                                   classify_int_count, library_size, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id, month) DO UPDATE SET
+            embed_count = usage_monthly.embed_count + EXCLUDED.embed_count,
+            classify_bg_count = usage_monthly.classify_bg_count + EXCLUDED.classify_bg_count,
+            classify_int_count = usage_monthly.classify_int_count + EXCLUDED.classify_int_count,
+            library_size = COALESCE(EXCLUDED.library_size, usage_monthly.library_size),
+            updated_at = EXCLUDED.updated_at
+        """,
+        (user_id, month_key(), embed, classify_bg, classify_int,
+         library_size, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
 
 def activate_subscription(stripe_customer_id, stripe_subscription_id):
     conn = get_db()
