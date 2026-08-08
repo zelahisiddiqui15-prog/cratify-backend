@@ -15,7 +15,10 @@ from models import (init_db, create_user, get_user, get_user_by_email,
                     get_user_by_username, username_exists, get_db,
                     increment_sorts, activate_subscription,
                     get_usage, add_usage, month_key,
-                    deactivate_subscription, set_stripe_customer, hash_password)
+                    deactivate_subscription, set_stripe_customer,
+                    verify_password, create_session, session_user_id,
+                    revoke_session)
+import time
 
 load_dotenv()
 
@@ -51,14 +54,53 @@ INTENT_MONTHLY_LIMIT = 2000
 SUMMARIZE_MONTHLY_LIMIT = 200
 
 
+# ── AUTH1: identity comes from a session token ───────────────────────────
+# The credential is an opaque bearer token issued at register/login; the
+# raw user_id in a body/query is the LEGACY path the desktop app still
+# uses until AUTH2 lands. The fallback logs on every use so its removal
+# date is decided by evidence, not hope.
+
+_LOGIN_ATTEMPTS = {}  # key → [timestamps]; in-memory, single-process (Railway runs one)
+
+def rate_limited(key, max_n, window_s):
+    now = time.time()
+    hits = [t for t in _LOGIN_ATTEMPTS.get(key, []) if now - t < window_s]
+    hits.append(now)
+    _LOGIN_ATTEMPTS[key] = hits
+    if len(_LOGIN_ATTEMPTS) > 10000:  # bound the dict, crude and sufficient
+        _LOGIN_ATTEMPTS.clear()
+    return len(hits) > max_n
+
+def bearer_token():
+    auth = request.headers.get("Authorization", "")
+    return auth[7:].strip() if auth.startswith("Bearer ") else None
+
+def request_identity(data):
+    """The one place identity is resolved. Returns (user_id, error_response,
+    status); error_response is None when identified. A PRESENT-but-invalid
+    token is a hard 401 — it never falls through to the legacy path, or a
+    revoked token would quietly keep working via the body user_id."""
+    tok = bearer_token()
+    if tok is not None:
+        uid = session_user_id(tok)
+        if not uid:
+            return None, jsonify({"error": "invalid or expired token"}), 401
+        return uid, None, 200
+    uid = (data or {}).get("user_id") or request.args.get("user_id")
+    if uid:
+        print("[auth] legacy user_id identity (pre-AUTH2 client)", flush=True)
+        return uid, None, 200
+    return None, jsonify({"error": "auth required"}), 401
+
 def meter_gate(data, kind, counter_field, limit, count=1):
     """METER2 — the one shape every spending endpoint uses: identity
-    required (400/404), ceiling checked BEFORE spend (429 monthly_limit),
+    required (401/404), ceiling checked BEFORE spend (429 monthly_limit),
     counting done by the caller AFTER success. Returns (error_response,
-    status, user_id); error_response is None when the call may proceed."""
-    user_id = (data or {}).get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400, None
+    status, user_id); error_response is None when the call may proceed.
+    AUTH1: identity now resolves token-first via request_identity()."""
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code, None
     if not get_user(user_id):
         return jsonify({"error": "user not found"}), 404, None
     used = get_usage(user_id).get(counter_field, 0) or 0
@@ -298,13 +340,22 @@ def health():
 
 @app.route("/auth/register", methods=["POST"])
 def register():
+    # AUTH1 — password is REQUIRED (optional-password registration created
+    # accounts that could never log in), min 6 chars to match the app's
+    # own copy: "Password must be at least 6 characters."
+    if rate_limited(f"register:{request.remote_addr}", 5, 3600):
+        return jsonify({"error": "too many attempts — try again later"}), 429
     data = request.json or {}
-    email = data.get("email")
+    email = (data.get("email") or "").strip().lower()
     password = data.get("password")
     username = data.get("username")
 
     if not email:
         return jsonify({"error": "email required"}), 400
+    if not password:
+        return jsonify({"error": "password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
 
     existing = get_user_by_email(email)
     if existing:
@@ -314,9 +365,11 @@ def register():
         return jsonify({"error": "username already taken"}), 409
 
     user_id = create_user(email=email, username=username, password=password)
+    token = create_session(user_id)
     return jsonify({
         "user_id": user_id,
         "username": username,
+        "session_token": token,
         "sorts_remaining": 25,
         "subscription_active": False
     })
@@ -325,30 +378,45 @@ def register():
 @app.route("/auth/login", methods=["POST"])
 def login():
     data = request.json or {}
-    identifier = data.get("email") or data.get("identifier")
+    identifier = (data.get("email") or data.get("identifier") or "").strip()
     password = data.get("password")
 
     if not identifier or not password:
         return jsonify({"error": "email/username and password required"}), 400
 
-    user = get_user_by_email(identifier)
+    # AUTH1 — rate limit per source+target: slows credential stuffing
+    # without letting an attacker lock a victim out from afar alone.
+    if rate_limited(f"login:{request.remote_addr}:{identifier.lower()}", 10, 900):
+        return jsonify({"error": "too many attempts — try again later"}), 429
+
+    user = get_user_by_email(identifier.lower())
     if not user:
         user = get_user_by_username(identifier)
 
-    if not user:
+    # AUTH1 — verify_password handles both hash generations (bcrypt, and
+    # legacy unsalted SHA-256 which it rehashes to bcrypt on success).
+    if not user or not verify_password(user, password):
         return jsonify({"error": "invalid credentials"}), 401
 
-    if user.get("password_hash") != hash_password(password):
-        return jsonify({"error": "invalid credentials"}), 401
-
+    token = create_session(user["id"])
     sorts_remaining = max(0, user["trial_limit"] - user["sorts_used"])
     return jsonify({
         "user_id": user["id"],
         "username": user.get("username"),
         "email": user["email"],
+        "session_token": token,
         "sorts_remaining": sorts_remaining if not user["subscription_active"] else None,
         "subscription_active": bool(user["subscription_active"])
     })
+
+
+@app.route("/auth/logout", methods=["POST"])
+def logout():
+    # AUTH1 — the point of sessions: sign-out actually revokes.
+    tok = bearer_token()
+    if not tok:
+        return jsonify({"error": "auth required"}), 401
+    return jsonify({"ok": revoke_session(tok)})
 
 
 @app.route("/auth/check-username", methods=["GET"])
@@ -362,9 +430,13 @@ def check_username():
 
 @app.route("/subscription/status", methods=["GET"])
 def subscription_status():
-    user_id = request.args.get("user_id")
+    # AUTH1 — token-required. This route returns email+username, and it
+    # used to hand them to anyone holding a bare user_id (info leak).
+    # Only caller is the website dashboard, which AUTH3 moves to tokens.
+    tok = bearer_token()
+    user_id = session_user_id(tok) if tok else None
     if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+        return jsonify({"error": "auth required"}), 401
 
     user = get_user(user_id)
     if not user:
@@ -675,8 +747,14 @@ def stripe_webhook():
 
 @app.route("/stripe/create-checkout-session", methods=["POST"])
 def create_checkout_session():
+    # AUTH1 — checkout needs a real identified user; it was previously
+    # unauthenticated with an arbitrary user_id in the body.
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404
     try:
         session = stripe.checkout.Session.create(
             ui_mode="embedded_page",
@@ -747,51 +825,6 @@ _PRESET_CLASSIFY_TOOL_SCHEMA = {
         "required": ["preset_category", "vibe_tags", "confidence"],
     },
 }
-
-
-_INTENT_SYSTEM = """You parse music producer chat messages into structured bulk file actions.
-
-Return ONLY a valid JSON object — no explanation, no markdown fences.
-
-Supported actions: "export" (copy files to a destination folder) or "move" (move files).
-Return action: null if the message is just a search or question, not a bulk operation.
-
-Output schema:
-{
-  "action": "export" | "move" | null,
-  "filter": {
-    "key":      string | null,   // musical key, e.g. "C# minor", "Am", "G major"
-    "category": string | null,   // e.g. "loop", "bass", "drum", "vocal", "pad"
-    "bpm_min":  number | null,
-    "bpm_max":  number | null,
-    "file_type": string | null   // extension without dot: "wav", "mp3", "midi"
-  },
-  "destination": string | null   // absolute path the user mentioned, or null
-}
-
-Decision rules:
-- "export / send / copy … to …"  → action: "export"
-- "move … to …"                  → action: "move"
-- "show / find / search / what"  → action: null
-- Vague questions with no clear destination → action: null
-- If destination folder is not explicitly stated → destination: null
-
-Examples:
-  "export all my C# minor loops to /Users/zee/Desktop"
-  → {"action":"export","filter":{"key":"C# minor","category":"loop","bpm_min":null,"bpm_max":null,"file_type":null},"destination":"/Users/zee/Desktop"}
-
-  "move all bass wav files to /Users/zee/Music/Project"
-  → {"action":"move","filter":{"key":null,"category":"bass","bpm_min":null,"bpm_max":null,"file_type":"wav"},"destination":"/Users/zee/Music/Project"}
-
-  "send everything between 120 and 130 bpm to my desktop"
-  → {"action":"export","filter":{"key":null,"category":null,"bpm_min":120,"bpm_max":130,"file_type":null},"destination":"/Users/zee/Desktop"}
-
-  "show me all loops in Am"
-  → {"action":null,"filter":{},"destination":null}
-
-  "find dark pads in C minor"
-  → {"action":null,"filter":{},"destination":null}
-"""
 
 
 @app.route("/suggest_prompts", methods=["POST"])
@@ -912,131 +945,19 @@ description text, no preamble."""
         return jsonify({"error": "model_error"}), 502
 
 
-@app.route("/intent", methods=["POST"])
-def intent():
-    """Parse a chat message for bulk file action intent using Claude Haiku."""
-    data = request.json or {}
-    err, code, _in_uid = meter_gate(data, "intent", "intent_count", INTENT_MONTHLY_LIMIT)
-    if err is not None:
-        return err, code
-    message = data.get("message", "").strip()
-    if not message:
-        return jsonify({"action": None})
-    try:
-        resp = anthropic_client.messages.create(
-            model=SMALL_MODEL,
-            max_tokens=256,
-            system=_INTENT_SYSTEM,
-            messages=[{"role": "user", "content": message}]
-        )
-        raw = resp.content[0].text.strip()
-        # Strip markdown fences if model wraps anyway
-        if raw.startswith("```"):
-            raw = "\n".join(raw.split("\n")[1:])
-            raw = raw.rsplit("```", 1)[0]
-        result = json.loads(raw.strip())
-        # Normalise: always return the top-level action key
-        if "action" not in result:
-            result["action"] = None
-        add_usage(_in_uid, intent=1)
-        return jsonify(result)
-    except Exception as e:
-        print(f"[/intent] error: {e}", flush=True)
-        return jsonify({"action": None})
-
-
-_PAIR_MAP = {
-    "kick":      ["snare", "clap", "hi-hat", "hihat"],
-    "bass":      ["pad", "lead", "pluck"],
-    "lead":      ["pad", "arp"],
-    "loop":      ["drum loop", "bass"],
-}
-
-@app.route("/pair", methods=["POST"])
-def pair():
-    """Given a filepath + category, return top 5 complementary files from target categories."""
-    data = request.json or {}
-    filepath = data.get("filepath", "").strip()
-    category = (data.get("category") or "").strip().lower()
-
-    if not filepath or not category:
-        return jsonify({"error": "filepath and category required"}), 400
-
-    # Determine target categories from pairing map
-    target_cats = None
-    for key, targets in _PAIR_MAP.items():
-        if key in category:
-            target_cats = targets
-            break
-    if not target_cats:
-        return jsonify({"error": f"no pairing defined for category '{category}'"}), 400
-
-    try:
-        import sqlite3 as _sqlite3
-        import numpy as _np
-        import base64 as _b64
-        from pathlib import Path as _Path
-        from scipy.spatial.distance import cosine as _cosine
-
-        db_path = str(_Path.home() / ".cratify" / "index.db")
-
-        # Load embedding for the query file
-        conn = _sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute("SELECT embedding FROM files WHERE filepath = ?", (filepath,))
-        row = c.fetchone()
-        conn.close()
-
-        if not row or not row[0]:
-            return jsonify({"error": "no embedding found for this file — run indexer first"}), 404
-
-        query_emb = _np.frombuffer(row[0], dtype=_np.float32)
-
-        # Build SQL LIKE clause for target categories (case-insensitive)
-        placeholders = " OR ".join(["LOWER(category) LIKE ?" for _ in target_cats])
-
-        conn2 = _sqlite3.connect(db_path)
-        c2 = conn2.cursor()
-        c2.execute(
-            f"SELECT filepath, filename, category, key, bpm, embedding FROM files "
-            f"WHERE embedding IS NOT NULL AND filepath != ? AND ({placeholders})",
-            [filepath] + [f"%{t}%" for t in target_cats],
-        )
-        candidates = c2.fetchall()
-        conn2.close()
-
-        results = []
-        for fp, fn, cat, key, bpm, emb_blob in candidates:
-            try:
-                emb = _np.frombuffer(emb_blob, dtype=_np.float32)
-                sim = float(1.0 - _cosine(query_emb, emb))
-                results.append({
-                    "filepath": fp,
-                    "filename": fn,
-                    "category": cat or "",
-                    "key": key or "",
-                    "bpm": bpm,
-                    "similarity": round(sim, 4),
-                })
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return jsonify({"pairs": results[:5], "target_categories": target_cats})
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
+# AUTH1 — /intent, /pair, /summarize_project deleted: PyQt-era routes
+# with zero callers in the Electron app, the plugin (rides the bridge),
+# or the website. Their usage counters/ceilings remain for history.
 
 @app.route("/usage", methods=["GET"])
 def usage():
     """METER1 — the honest-state surface: what this user has spent this
     month, against which limits, so the app can SAY when work is paused."""
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+    # AUTH1 — token-first; the desktop's ?user_id= query keeps working
+    # through the legacy path until AUTH2. Counters only — no PII here.
+    user_id, err, code = request_identity(None)
+    if err is not None:
+        return err, code
     if not get_user(user_id):
         return jsonify({"error": "user not found"}), 404
     u = get_usage(user_id)
@@ -1066,10 +987,12 @@ def usage_report():
     """Client reports library size after a scan — the third axis the
     pricing decision needs (spend means nothing without library size)."""
     data = request.json or {}
-    user_id = data.get("user_id")
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
     size = data.get("library_size")
-    if not user_id or not isinstance(size, int) or size < 0:
-        return jsonify({"error": "user_id and library_size (int) required"}), 400
+    if not isinstance(size, int) or size < 0:
+        return jsonify({"error": "library_size (int) required"}), 400
     if not get_user(user_id):
         return jsonify({"error": "user not found"}), 404
     add_usage(user_id, library_size=size)
@@ -1122,141 +1045,6 @@ def embed():
         "model": EMBED_MODEL,
         "dimension": EMBED_DIMENSION,
     })
-
-
-@app.route("/summarize_project", methods=["POST"])
-def summarize_project():
-    """Generate a 1-liner project summary for the sidebar.
-
-    Notes are the source of truth (the project brief).
-    Chat history layers on evolution — but dominant patterns win
-    over one-off tangents.
-
-    Request body:
-      {
-        "notes": "G minor sad/melancholic with two drops" (str),
-        "messages": [
-          {"role": "user", "content": "find me an arp"},
-          {"role": "assistant", "content": "..."},
-          ...
-        ]  (list, last ~20 messages, can be empty)
-      }
-
-    Response:
-      { "summary": "G min · 128 BPM · dark/melancholic" }
-
-    Cost: ~$0.0015 per call (Haiku 4.5).
-    """
-    data = request.get_json(force=True) or {}
-    err, code, _sp_uid = meter_gate(data, "summarize", "summarize_count", SUMMARIZE_MONTHLY_LIMIT)
-    if err is not None:
-        return err, code
-    notes = (data.get("notes") or "").strip()
-    messages = data.get("messages", [])
-
-    # If we have neither notes nor messages, return empty — nothing
-    # to summarize. Client falls back to first line of notes (which
-    # is also empty in this case, so sidebar shows nothing).
-    if not notes and not messages:
-        return jsonify({"summary": ""})
-
-    # Build the chat transcript section. Cap at last 20 messages
-    # to keep token count predictable. Skip empty messages.
-    transcript_lines = []
-    for m in messages[-20:]:
-        role = m.get("role", "")
-        content = (m.get("content") or "").strip()
-        if not content or role not in ("user", "assistant"):
-            continue
-        # Trim each message to ~200 chars to stay focused on intent
-        if len(content) > 200:
-            content = content[:200] + "..."
-        prefix = "User" if role == "user" else "AI"
-        transcript_lines.append(f"{prefix}: {content}")
-    transcript = "\n".join(transcript_lines) if transcript_lines else "(no chat history yet)"
-
-    notes_block = notes if notes else "(no notes provided)"
-
-    system_prompt = """You are a music producer's assistant generating a glanceable 1-line summary of a song project for a sidebar UI.
-
-The producer needs to scan a list of 5-15 active song projects and immediately remember what each one is about. Your output is the entire 1-liner shown under the project name.
-
-YOU WILL RECEIVE:
-1. PROJECT NOTES — the producer's explicit brief (highest priority, treat as source of truth)
-2. RECENT CHAT HISTORY — messages between the producer and the AI inside this project (use to surface dominant patterns, NOT to chase recent tangents)
-
-CRITICAL RULES:
-- NOTES ARE THE ANCHOR. If notes say "G minor", the summary stays G minor even if recent messages mention other keys.
-- DOMINANT PATTERNS WIN. If user discussed key X across 8 messages and key Y in 1 message, summary uses key X. Tangents do not shift the summary.
-- BE TERSE. Producer shorthand only. No adjectives like "really" / "kind of" / "very" / "with".
-- STRICT FORMAT: <key> · <BPM> · <2-3 vibe tags>
-- USE BULLET SEPARATOR: · (middle dot, U+00B7) between sections
-- MAX 8 WORDS TOTAL
-- ACCEPT ANY KEY FORMAT in input. Producers write keys many ways. ALL of these mean the same key:
-    "G", "GMaj", "G Maj", "GMajor", "G Major", "G-Major", "Major G", "g maj", "g major" → all = G major
-    "Gm", "Gmin", "G min", "G Minor", "G-Minor", "Minor G", "g minor" → all = G minor
-    Same applies to every key (F#, Bb, C#, etc.). When the modifier is missing or ambiguous, default to MAJOR.
-- EMIT keys in ONE strict output format only:
-    Major keys → "<Note>Maj"  (examples: "GMaj", "F#Maj", "BbMaj", "CMaj", "DMaj")
-    Minor keys → "<Note>m"    (examples: "Gm", "F#m", "Bbm", "Cm", "Dm")
-- BPM: integer or short range like "128" or "120-130"
-- Vibe tags: 1-3 short tags like "dark", "melancholic", "uplifting", "trap", "dubstep", "afro house"
-
-EXAMPLES (note the consistent output format):
-"Gm · 128 BPM · dark trap"
-"GMaj · 155 BPM · melodic dubstep"
-"F#m · 140 BPM · dubstep, melancholic"
-"DMaj · 120 BPM · uplifting, melodic"
-"Am · 90/180 BPM · afro house"
-"Em · ~125 BPM · progressive, uplifting"
-"BbMaj · 110 BPM · jazzy, warm"
-
-If you cannot determine a section, omit it. E.g. if no key is clear: "128 BPM · dark trap". If only key is clear: "GMaj · melancholic".
-
-If neither notes nor chat history give you anything to work with, return an empty string.
-
-Respond with ONLY the 1-liner. No quotes, no explanation, no preamble."""
-
-    user_prompt = f"""PROJECT NOTES:
-{notes_block}
-
-RECENT CHAT HISTORY (last 20 messages, oldest first):
-{transcript}
-
-Generate the 1-liner."""
-
-    try:
-        anthropic_client = anthropic.Anthropic(
-            api_key=os.environ["ANTHROPIC_API_KEY"]
-        )
-        response = anthropic_client.messages.create(
-            model=SMALL_MODEL,
-            max_tokens=60,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-    except Exception as e:
-        print(f"[summarize_project] claude call failed: {e}", flush=True)
-        return jsonify({"error": f"claude_failed: {e}"}), 500
-
-    # Extract text from the response. Haiku returns text content blocks.
-    summary = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            summary += block.text
-    summary = summary.strip()
-
-    # Defensive cleanup: strip surrounding quotes if Claude added them,
-    # collapse whitespace, cap length so a misbehaving response can't
-    # blow out the sidebar.
-    summary = summary.strip('"').strip("'").strip()
-    summary = " ".join(summary.split())  # collapse internal whitespace
-    if len(summary) > 80:
-        summary = summary[:77] + "..."
-
-    print(f"[summarize_project] summary: {summary!r}", flush=True)
-    add_usage(_sp_uid, summarize=1)
-    return jsonify({"summary": summary})
 
 
 @app.route("/search", methods=["POST"])

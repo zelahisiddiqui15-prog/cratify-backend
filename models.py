@@ -1,9 +1,12 @@
 import os
 import uuid
 import hashlib
+import hmac
+import secrets
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import bcrypt
 
 TRIAL_LIMIT = 25
 
@@ -11,8 +14,85 @@ def get_db():
     conn = psycopg2.connect(os.getenv("DATABASE_URL"), sslmode="prefer")
     return conn
 
+# AUTH1 — legacy hash, kept ONLY so pre-AUTH1 accounts can still log in
+# (their stored hashes are unsalted SHA-256). verify_password() upgrades
+# them to bcrypt on the first successful login; nothing writes this
+# format anymore.
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
+
+def hash_password_bcrypt(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def verify_password(user, password):
+    """AUTH1 — the one place passwords are checked. Handles both hash
+    generations; a legacy SHA-256 match is transparently rehashed to
+    bcrypt so the weak format dies out one login at a time. Accounts
+    registered without a password (pre-AUTH1 ghosts) always fail."""
+    stored = user.get("password_hash")
+    if not stored or not password:
+        return False
+    if stored.startswith("$2"):
+        try:
+            return bcrypt.checkpw(password.encode(), stored.encode())
+        except ValueError:
+            return False
+    if hmac.compare_digest(stored, hash_password(password)):
+        set_password_hash(user["id"], hash_password_bcrypt(password))
+        return True
+    return False
+
+def set_password_hash(user_id, password_hash):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                (password_hash, user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ── AUTH1: sessions — the credential is an opaque server-issued token,
+# not the user_id. Revocable (logout deletes the row), and the user_id
+# stops being a spendable secret once AUTH2 moves the desktop onto it.
+def create_session(user_id):
+    conn = get_db()
+    cur = conn.cursor()
+    token = secrets.token_urlsafe(32)
+    now = datetime.utcnow().isoformat()
+    cur.execute(
+        "INSERT INTO sessions (token, user_id, created_at, last_used_at) VALUES (%s, %s, %s, %s)",
+        (token, user_id, now, now)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return token
+
+def session_user_id(token):
+    """user_id for a live token, or None. Touches last_used_at so stale
+    sessions are identifiable later (no expiry policy yet — that's a
+    product decision, and revocation already works via logout)."""
+    if not token:
+        return None
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE sessions SET last_used_at = %s WHERE token = %s RETURNING user_id",
+                (datetime.utcnow().isoformat(), token))
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return row[0] if row else None
+
+def revoke_session(token):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    return deleted > 0
 
 def init_db():
     conn = get_db()
@@ -58,6 +138,15 @@ def init_db():
     # METER1b -- first-index library size, set once, on users: the growth
     # baseline. usage_monthly.library_size is the per-month time series.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_library_size INTEGER")
+    # AUTH1 — sessions: opaque bearer tokens, one row per login.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT,
+            last_used_at TEXT
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -67,7 +156,9 @@ def create_user(email=None, username=None, password=None):
     cur = conn.cursor()
     user_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
-    password_hash = hash_password(password) if password else None
+    # AUTH1 — new accounts are bcrypt from birth; the route requires a
+    # password, the None branch survives only for internal/test seeding.
+    password_hash = hash_password_bcrypt(password) if password else None
     cur.execute(
         "INSERT INTO users (id, email, username, password_hash, created_at) VALUES (%s, %s, %s, %s, %s)",
         (user_id, email, username, password_hash, now)
