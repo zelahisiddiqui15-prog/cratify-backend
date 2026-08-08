@@ -71,6 +71,12 @@ def rate_limited(key, max_n, window_s):
         _LOGIN_ATTEMPTS.clear()
     return len(hits) > max_n
 
+def client_ip():
+    # Railway sits behind a proxy: remote_addr is the edge node, not the
+    # client — and it varies, which quietly disables per-IP limiting.
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() if fwd else request.remote_addr
+
 def bearer_token():
     auth = request.headers.get("Authorization", "")
     return auth[7:].strip() if auth.startswith("Bearer ") else None
@@ -343,7 +349,7 @@ def register():
     # AUTH1 — password is REQUIRED (optional-password registration created
     # accounts that could never log in), min 6 chars to match the app's
     # own copy: "Password must be at least 6 characters."
-    if rate_limited(f"register:{request.remote_addr}", 5, 3600):
+    if rate_limited(f"register:{client_ip()}", 5, 3600):
         return jsonify({"error": "too many attempts — try again later"}), 429
     data = request.json or {}
     email = (data.get("email") or "").strip().lower()
@@ -386,7 +392,7 @@ def login():
 
     # AUTH1 — rate limit per source+target: slows credential stuffing
     # without letting an attacker lock a victim out from afar alone.
-    if rate_limited(f"login:{request.remote_addr}:{identifier.lower()}", 10, 900):
+    if rate_limited(f"login:{client_ip()}:{identifier.lower()}", 10, 900):
         return jsonify({"error": "too many attempts — try again later"}), 429
 
     user = get_user_by_email(identifier.lower())
@@ -460,10 +466,13 @@ def subscription_status():
 def classify():
     data = request.json or {}
     filename = data.get("filename")
-    user_id = data.get("user_id")
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
 
-    if not filename or not user_id:
-        return jsonify({"error": "filename and user_id required"}), 400
+    # AUTH1 — token-first identity (see /embed).
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
 
     user = get_user(user_id)
     if not user:
@@ -531,9 +540,12 @@ def classify_batch():
     """
     data = request.json or {}
     filenames = data.get("filenames")
-    user_id = data.get("user_id")
-    if not isinstance(filenames, list) or not filenames or not user_id:
-        return jsonify({"error": "filenames (list) and user_id required"}), 400
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({"error": "filenames (list) required"}), 400
+    # AUTH1 — token-first identity (see /embed).
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
     if len(filenames) > 50:
         return jsonify({"error": "max 50 filenames per call"}), 400
     if not all(isinstance(f, str) and f for f in filenames):
@@ -624,14 +636,18 @@ def classify_preset():
     """
     data = request.json or {}
     filename = data.get("filename")
-    user_id = data.get("user_id")
     plugin_name = (data.get("plugin_name") or "Unknown").strip() or "Unknown"
     vendor = (data.get("vendor") or "Unknown").strip() or "Unknown"
     folder_name = (data.get("folder_name") or "").strip()
     current_tags = (data.get("current_tags") or "").strip()
 
-    if not filename or not user_id:
-        return jsonify({"error": "filename and user_id required"}), 400
+    if not filename:
+        return jsonify({"error": "filename required"}), 400
+
+    # AUTH1 — token-first identity (see /embed).
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
 
     user = get_user(user_id)
     if not user:
@@ -1012,9 +1028,12 @@ def embed():
     # METER1 — /embed had NO identity and NO ceiling: an anonymous Voyage
     # proxy whose cost was bounded only by a client-side setting. Identity
     # is now required and the monthly ceiling is checked BEFORE any spend.
-    user_id = data.get("user_id")
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
+    # AUTH1 — identity resolves token-first (this inline gate predated
+    # meter_gate and was token-blind: a bad token fell through to the
+    # body user_id, which defeats revocation).
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
     if not get_user(user_id):
         return jsonify({"error": "user not found"}), 404
     used = get_usage(user_id)["embed_count"]
