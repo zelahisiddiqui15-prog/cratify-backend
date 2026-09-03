@@ -1154,6 +1154,28 @@ def search():
     print(f"[search] usage {usage_out}", flush=True)
     add_usage(_search_uid, search=1)
 
+    # SONG1 S18 — name the cause instead of letting it surface as a shape
+    # error downstream. When the model runs out of output budget mid-JSON
+    # the tool input arrives incomplete, which is exactly how `picks`
+    # became a string carrying half a reply. stop_reason says so directly,
+    # so say it here rather than making the desktop infer it from a
+    # malformed payload it cannot read.
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "max_tokens":
+        print(
+            f"[search] TRUNCATED: stop_reason=max_tokens, output_tokens={_u.output_tokens} "
+            f"of max_tokens=2000 — the tool input is incomplete",
+            flush=True,
+        )
+        return jsonify({
+            "error": "truncated_output",
+            "detail": (
+                f"the model hit the output limit ({_u.output_tokens} tokens) before finishing "
+                "its answer, so the result is incomplete"
+            ),
+            "usage": usage_out,
+        }), 502
+
     if tool_use is None:
         print(f"[search] no tool_use block returned. Content: {response.content}", flush=True)
         return jsonify({
@@ -1165,12 +1187,87 @@ def search():
             "usage": usage_out,
         })
 
-    parsed = tool_use.input  # guaranteed dict matching schema
+    # SONG1 S18 (ruled 2026-09-03) — "guaranteed dict matching schema" was
+    # an assumption, and it broke in production: `picks` came back as a
+    # STRING carrying the model's entire response — the picks array AND a
+    # "reply" key — as raw text, with filters_used {} and broad_count 0.
+    # The desktop client's shape check refused it (correctly, and that
+    # behaviour stays), but it could only report a generic backend error
+    # because THIS endpoint had shipped unparsed text inside a typed field
+    # with a 200.
+    #
+    # Two rules now, in order:
+    #   1. PARSE PROPERLY. A JSON string where an array belongs is a
+    #      recoverable shape, so recover it — once, deliberately, and only
+    #      into the field it belongs in.
+    #   2. FAIL LOUDLY. If it still is not the shape the schema promises,
+    #      this endpoint returns an ERROR. Shipping a typed field full of
+    #      text is worse than failing: the client cannot tell a broken
+    #      contract from an empty result, and the user gets a silent
+    #      fallback with no way to learn why.
+    parsed = tool_use.input
+    if not isinstance(parsed, dict):
+        print(f"[search] tool input is {type(parsed).__name__}, not dict: {str(parsed)[:500]}", flush=True)
+        return jsonify({"error": "bad_tool_input", "detail": f"tool input was {type(parsed).__name__}"}), 502
+
+    picks_raw = parsed.get("picks", [])
+    if isinstance(picks_raw, str):
+        # The model emitted its whole tool input as a string. Try once to
+        # read it back; a truncated blob will not parse, which is the
+        # signal we want rather than a half-answer.
+        print(f"[search] picks arrived as a STRING ({len(picks_raw)} chars) — attempting recovery", flush=True)
+        recovered = None
+        try:
+            recovered = json.loads(picks_raw)
+        except Exception:
+            # A common shape: "[...],\n\"reply\": \"...\"" — the array plus
+            # trailing keys. Take the balanced array prefix if there is one.
+            depth, end = 0, -1
+            for i, ch in enumerate(picks_raw):
+                if ch == "[":
+                    depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end > 0:
+                try:
+                    recovered = json.loads(picks_raw[:end])
+                except Exception:
+                    recovered = None
+        if isinstance(recovered, list):
+            print(f"[search] recovered {len(recovered)} picks from the string", flush=True)
+            picks_raw = recovered
+        else:
+            print(f"[search] picks string could NOT be parsed — failing loudly", flush=True)
+            return jsonify({
+                "error": "unparseable_picks",
+                "detail": "the model returned picks as text that is not valid JSON (likely truncated output)",
+                "usage": usage_out,
+            }), 502
+
+    if not isinstance(picks_raw, list):
+        print(f"[search] picks is {type(picks_raw).__name__}, not list — failing loudly", flush=True)
+        return jsonify({
+            "error": "bad_picks_type",
+            "detail": f"picks was {type(picks_raw).__name__}, expected list",
+            "usage": usage_out,
+        }), 502
+
+    reply_val = parsed.get("reply", "")
+    if not isinstance(reply_val, str):
+        print(f"[search] reply is {type(reply_val).__name__}, not str — failing loudly", flush=True)
+        return jsonify({
+            "error": "bad_reply_type",
+            "detail": f"reply was {type(reply_val).__name__}, expected string",
+            "usage": usage_out,
+        }), 502
 
     out = {
-        "picks": parsed.get("picks", []),
-        "filters_used": parsed.get("filters_used", {}),
-        "reply": parsed.get("reply", ""),
+        "picks": picks_raw,
+        "filters_used": parsed.get("filters_used", {}) if isinstance(parsed.get("filters_used"), dict) else {},
+        "reply": reply_val,
         "broad_count": 0,
         "usage": usage_out,
     }
