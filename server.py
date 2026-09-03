@@ -197,6 +197,12 @@ def postprocess_result(result, filename):
 # Also note: Sonnet 5 runs ADAPTIVE thinking when `thinking` is omitted,
 # unlike 4.6 — see the explicit {"type": "disabled"} at the /search call.
 SEARCH_MODEL = "claude-sonnet-4-6"
+# SONG1 S18 (ruled 2026-09-03) — ONE ceiling, so the limit, the
+# truncation message and the usage report can never disagree about what
+# the budget was. Raised 2000 -> 4000 after production truncation; output
+# is billed on tokens GENERATED, so the only calls this makes more
+# expensive are the ones that were failing.
+SEARCH_MAX_OUTPUT_TOKENS = 4000
 
 SEARCH_SYSTEM_DIRECTIVES = """You are Cratify, an AI music producer assistant. You help producers find the perfect sample from their personal library.
 
@@ -1116,7 +1122,16 @@ def search():
     try:
         response = anthropic_client.messages.create(
             model=SEARCH_MODEL,
-            max_tokens=2000,
+            # SONG1 S18 (ruled 2026-09-03) — 2000 was marginal for a call
+            # that must emit up to 8 picks WITH reasons plus a reply, and
+            # it truncated in production: the tool input arrived incomplete
+            # and `picks` reached the client as a half-written string.
+            # Output is billed on tokens GENERATED, not on the ceiling, so
+            # raising this costs nothing on calls that already fit — only
+            # the ones that were failing get longer, and those were worth
+            # nothing at all. SEARCH_OUTPUT_TOKENS below reports the real
+            # usage so this number is set from evidence next time.
+            max_tokens=SEARCH_MAX_OUTPUT_TOKENS,
             # Gate BE1 decision #3 — preserve today's behaviour exactly.
             # Sonnet 5 runs ADAPTIVE thinking when this is omitted (4.6 ran
             # thinking-off), which would share the 2000-token budget with the
@@ -1164,7 +1179,7 @@ def search():
     if stop_reason == "max_tokens":
         print(
             f"[search] TRUNCATED: stop_reason=max_tokens, output_tokens={_u.output_tokens} "
-            f"of max_tokens=2000 — the tool input is incomplete",
+            f"of max_tokens={SEARCH_MAX_OUTPUT_TOKENS} — the tool input is incomplete",
             flush=True,
         )
         return jsonify({
@@ -1271,6 +1286,25 @@ def search():
         "broad_count": 0,
         "usage": usage_out,
     }
+    # SONG1 S18 (ruled) — the ceiling should be set from evidence, not a
+    # guess. This line is what makes that possible: every SUCCESSFUL
+    # search reports what it actually generated against the ceiling, so
+    # "is 4000 right?" becomes a reading rather than an argument. The
+    # NEAR-CEILING warning is the early signal that the next raise is due
+    # — before it truncates, not after.
+    _pct = round(100 * _u.output_tokens / SEARCH_MAX_OUTPUT_TOKENS)
+    print(
+        f"[search] SEARCH_OUTPUT_TOKENS {_u.output_tokens} of {SEARCH_MAX_OUTPUT_TOKENS} ({_pct}%) "
+        f"picks={len(picks_raw)}",
+        flush=True,
+    )
+    if _pct >= 75:
+        print(
+            f"[search] NEAR CEILING: {_u.output_tokens}/{SEARCH_MAX_OUTPUT_TOKENS} tokens "
+            f"({_pct}%) — raise max_tokens before this truncates",
+            flush=True,
+        )
+
     prog = parsed.get("progression")
     if isinstance(prog, list) and prog:
         out["progression"] = prog
