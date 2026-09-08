@@ -250,6 +250,7 @@ Guidelines for your response:
 - HOW TO NAME A FILE IN PROSE: use a SHORT HUMAN DESCRIPTOR, not the raw filename. Write "the smooth 808", "that reso 808", "the KSHMR sub" — NOT "91V_LRB_808_smooth_C.wav". Long underscored filenames are unreadable mid-sentence and the UI renders your descriptor as a clickable chip anyway, so the user never needs to see the raw name to act on it.
 - mentions (REQUIRED FIELD): for EVERY file reference in your reply, add {id, text} where `text` is the EXACT substring of your reply naming it, copied character-for-character — same spelling, same case, no trailing punctuation — so it can be found by plain string search. If your reply mentions three files, mentions has three entries. This is what turns your words into play/reveal buttons; a reference with no mentions entry is dead text to the user. Only ids from the candidate list. If the reply genuinely names no file, return an empty array.
   EACH `text` SPAN MUST BE UNIQUE WITHIN THE REPLY. The span is found by plain string search, so two mentions sharing the same wording are indistinguishable — one file silently stands in for both and the user cannot tell which one they are hearing. If you want to point at two files that would naturally share a phrase ("the Au5 dub kicks"), either name them distinctly ("the first Au5 dub kick" / "the second Au5 dub kick") or refer to only one of them. Never emit two mentions with identical `text`.
+  THE SPAN MUST ALSO BE UNIQUE AS A PHRASE. It is located by plain string search, so it must occur EXACTLY ONCE in your whole reply — a bare word you use more than once ("arp", "strings", "the pad", "loop") is forbidden as a span even when only one mention uses it, because the search finds your FIRST use of that word and chips the wrong file there. Choose a phrase you write once and nowhere else: "the afro house arp", "the Gm string stack". Before you emit a span, re-read your reply and check that its exact characters appear one time only.
 - filters_used: describes the broader search the user might want ("all vocal chops in Gm around 140 BPM") - be permissive, it's an escape hatch. Any field can be omitted if not inferrable.
 - category MUST be one of the library's real category values: Ambient, Bass, Chord, Drums, FX, Guitar, Keys, Melody, Other, Pad, Synth, Vocals. These are the values files actually carry — any other word makes the 'see more' filter match nothing.
 - progression: ONLY when your reply prescribes a chord sequence (e.g. "Fm -> Db -> Ab -> Eb, i -> VI -> III -> VII") AND candidate files match its chords (many filenames carry roman numerals and chord names — e.g. "i - F min.mid", "VI - Db Maj.mid"): populate progression with one entry per step IN PLAYING ORDER, mapping each step to the candidate ids whose filename matches that chord, best first. A step with no matching file gets an empty pick_ids — NEVER force a bad match. Your reply prose is unchanged either way.
@@ -1437,13 +1438,29 @@ def search():
                 f"span not present in the reply: {dropped}",
                 flush=True,
             )
-        # NOT dropped, only reported: a span that occurs MORE than once is a
-        # different defect (one file silently standing in for another) and
-        # has not been ruled on. Counting it here gives that ruling data
-        # instead of an argument.
-        _dupes = [m.get("text") for m in kept if reply_val.count(m.get("text", "")) > 1]
-        if _dupes:
-            print(f"[search] MENTIONS AMBIGUOUS (kept, span occurs >1x): {_dupes}", flush=True)
+        # BATTERY-FIX B (ruled 2026-09-08) — AN AMBIGUOUS SPAN IS DROPPED
+        # TOO, for the same reason an absent one is: it cannot identify a
+        # file. The client finds the span by plain string search and chips
+        # the FIRST occurrence, so a span appearing three times points at
+        # whichever file happens to come first in the prose — and the user
+        # clicking it has no way to know it is the wrong one. Silently
+        # wrong is worse than absent.
+        #
+        # Measured, not hypothetical: a live q02 run returned mentions
+        # "arp" (3 occurrences in its own reply) and "strings" (2), from
+        #   "The pad, pluck, arp, and strings are great for verse texture
+        #    … the afro house arp and the strings in particular …"
+        # This was reported and left un-ruled by the previous change; it
+        # is ruled now.
+        ambiguous = [m for m in kept if reply_val.count(m.get("text", "")) > 1]
+        if ambiguous:
+            kept = [m for m in kept if m not in ambiguous]
+            print(
+                f"[search] MENTIONS DROPPED {len(ambiguous)} — span occurs more than once "
+                f"in the reply, so it names no single file: "
+                f"{[(m.get('text'), reply_val.count(m.get('text', ''))) for m in ambiguous]}",
+                flush=True,
+            )
         out["mentions"] = kept
     print(f"[search] tool keys={sorted(parsed.keys())} mentions={len(mentions) if isinstance(mentions, list) else 'ABSENT'}", flush=True)
     return jsonify(out)
