@@ -246,6 +246,7 @@ Guidelines for your response:
   Practical use: do not re-recommend a file that is already on that list unless you have a specific reason, and say the reason ("still the best fit for this, even though you've already tried it"). Prefer offering things that COMPLEMENT the direction the list shows.
   If there is no such line, the user has tried nothing in this project yet — say nothing about it either way.
 - NEVER mention the [ID] numbers in your reply text.
+- THE MIDI LIMIT IS MANDATORY, NOT OPTIONAL. A .mid file contains no audio: the app cannot pitch-shift or time-stretch it, because there is nothing to stretch. So if your reply says ANYTHING about files landing in key or tempo on their own — "these all land in Gm automatically", "they snap to 116", "just drop and go" — and ANY of your picks is a .mid, you MUST also state the limit in the same reply, in your own words. Say that the MIDI files play whatever instrument the user loads them into and do not retune themselves. Scoping the warp claim to the audio picks by name is equally fine ("the Titan chord loop is audio, so it lands on its own"). What is NOT acceptable is a blanket "all of these" over a crate that contains MIDI: that sentence is false, and the user finds out when the file plays in the wrong key.
 - HOW TO NAME A FILE IN PROSE: use a SHORT HUMAN DESCRIPTOR, not the raw filename. Write "the smooth 808", "that reso 808", "the KSHMR sub" — NOT "91V_LRB_808_smooth_C.wav". Long underscored filenames are unreadable mid-sentence and the UI renders your descriptor as a clickable chip anyway, so the user never needs to see the raw name to act on it.
 - mentions (REQUIRED FIELD): for EVERY file reference in your reply, add {id, text} where `text` is the EXACT substring of your reply naming it, copied character-for-character — same spelling, same case, no trailing punctuation — so it can be found by plain string search. If your reply mentions three files, mentions has three entries. This is what turns your words into play/reveal buttons; a reference with no mentions entry is dead text to the user. Only ids from the candidate list. If the reply genuinely names no file, return an empty array.
   EACH `text` SPAN MUST BE UNIQUE WITHIN THE REPLY. The span is found by plain string search, so two mentions sharing the same wording are indistinguishable — one file silently stands in for both and the user cannot tell which one they are hearing. If you want to point at two files that would naturally share a phrase ("the Au5 dub kicks"), either name them distinctly ("the first Au5 dub kick" / "the second Au5 dub kick") or refer to only one of them. Never emit two mentions with identical `text`.
@@ -1084,6 +1085,57 @@ def embed():
     })
 
 
+# ── BATTERY-FIX A (ruled 2026-09-08) — THE MANDATORY MIDI CAVEAT ──────
+#
+# SEARCH-BATTERY measured the same query stating the MIDI limit on one run
+# and omitting it on the next: q15 said "give you full control over the
+# sound" on 2026-09-07 and said nothing at all on 2026-09-08, and q02 said
+# "All of these land in Gm automatically" over a crate containing a MIDI
+# file. The directive asked for the caveat; a directive cannot GUARANTEE
+# one, so this does it in code.
+#
+# The two predicates are ported verbatim from scripts/verify-reply-shape.mjs
+# in cratify-desktop. They are duplicated across a process boundary on
+# purpose — the guard cannot import from a Flask app and the app cannot
+# import from a Node script — so the pairing is asserted by test on both
+# sides rather than by hope: the desktop selftest carries the appended
+# sentence as a required PASS, and the unit test below runs these patterns
+# against the same real captures.
+_AUTO_WARP_CLAIM = _re.compile(
+    r"(land|lands|landing) in (your |the )?(key|tempo)|on its own|automatically"
+    r"|auto-?(pitch|bpm)|already (matched|in key|in tempo)",
+    _re.I,
+)
+_MIDI_CLAIM = _re.compile(
+    r"midi[^.!?]*((contain|have|has|carr(y|ies))\s+no\s+audio"
+    r"|no\s+audio\s+of\s+(its|their)\s+own"
+    r"|\b(manual|manually|yourself|your own)\b"
+    r"|(full )?control over the (sound|tone|instrument)"
+    r"|(pick|choose|supply|bring|add)[^.!?]*\b(sound|instrument|synth)\b"
+    r"|need[^.!?]*\b(instrument|synth|sampler)\b"
+    r"|(don'?t|do not|won'?t|will not|never)\s+(retune|re-tune|warp|pitch|transpose))",
+    _re.I,
+)
+# The exact sentence, ruled. It satisfies _MIDI_CLAIM ("don't retune"),
+# which is what makes this idempotent: once appended, the condition that
+# triggers it is false.
+MIDI_CAVEAT = (
+    "The MIDI files play whatever instrument you load them into — "
+    "they don't retune on their own."
+)
+_MIDI_NAME = _re.compile(r"\.midi?\b", _re.I)
+
+
+def needs_midi_caveat(reply, picked_ids, midi_ids):
+    """True when the prose promises a warp over a crate that contains MIDI
+    and never states the limit. Idempotent by construction."""
+    if not any(pid in midi_ids for pid in picked_ids):
+        return False
+    if not _AUTO_WARP_CLAIM.search(reply):
+        return False
+    return not _MIDI_CLAIM.search(reply)
+
+
 @app.route("/search", methods=["POST"])
 def search():
     """Semantic search: client sends top-50 candidates by cosine similarity,
@@ -1290,6 +1342,29 @@ def search():
             "detail": f"reply was {type(reply_val).__name__}, expected string",
             "usage": usage_out,
         }), 502
+
+    # BATTERY-FIX A — the caveat, appended before anything reads the reply
+    # (mention spans are validated against the FINAL text further down).
+    #
+    # WHICH PICKS ARE MIDI: the payload carries only {id, meta_text}, so
+    # file_type is not available server-side and the filename is read
+    # instead. Gate C11 guarantees the filename LEADS meta_text, so a
+    # ".mid"/".midi" there is the file's own extension. Sending file_type
+    # in the candidate payload would be cleaner and needs a client change
+    # shipped first; logged, not done here.
+    _midi_ids = {
+        c.get("id")
+        for c in candidates
+        if isinstance(c, dict) and _MIDI_NAME.search(str(c.get("meta_text", "")))
+    }
+    _picked_ids = [p.get("id") for p in picks_raw if isinstance(p, dict)]
+    if needs_midi_caveat(reply_val, _picked_ids, _midi_ids):
+        reply_val = reply_val.rstrip() + " " + MIDI_CAVEAT
+        print(
+            f"[search] MIDI CAVEAT APPENDED — {sum(1 for p in _picked_ids if p in _midi_ids)}"
+            f" of {len(_picked_ids)} picks are MIDI and the reply claimed a warp without the limit",
+            flush=True,
+        )
 
     out = {
         "picks": picks_raw,
