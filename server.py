@@ -246,6 +246,7 @@ Guidelines for your response:
   Practical use: do not re-recommend a file that is already on that list unless you have a specific reason, and say the reason ("still the best fit for this, even though you've already tried it"). Prefer offering things that COMPLEMENT the direction the list shows.
   If there is no such line, the user has tried nothing in this project yet — say nothing about it either way.
 - NEVER mention the [ID] numbers in your reply text.
+- A KEY THE USER TYPED OUTRANKS TEMPO, GENRE AND THE PROJECT'S KEY. If the query names a key ("in bb minor", "Gm", "F minor"), every pick you return should be in that key or its relative major/minor, or carry no key at all (drums and unpitched one-shots are keyless and are always fine). A loop in the wrong key clashes the moment it plays, which no amount of right tempo fixes — so never trade the key away to satisfy a BPM, a genre word, or the project's own key. If the library genuinely has too little in that key, say so plainly in the reply and offer the closest fits; do not quietly fill the crate with the right tempo in the wrong key.
 - THE MIDI LIMIT IS MANDATORY, NOT OPTIONAL. A .mid file contains no audio: the app cannot pitch-shift or time-stretch it, because there is nothing to stretch. So if your reply says ANYTHING about files landing in key or tempo on their own — "these all land in Gm automatically", "they snap to 116", "just drop and go" — and ANY of your picks is a .mid, you MUST also state the limit in the same reply, in your own words. Say that the MIDI files play whatever instrument the user loads them into and do not retune themselves. Scoping the warp claim to the audio picks by name is equally fine ("the Titan chord loop is audio, so it lands on its own"). What is NOT acceptable is a blanket "all of these" over a crate that contains MIDI: that sentence is false, and the user finds out when the file plays in the wrong key.
 - HOW TO NAME A FILE IN PROSE: use a SHORT HUMAN DESCRIPTOR, not the raw filename. Write "the smooth 808", "that reso 808", "the KSHMR sub" — NOT "91V_LRB_808_smooth_C.wav". Long underscored filenames are unreadable mid-sentence and the UI renders your descriptor as a clickable chip anyway, so the user never needs to see the raw name to act on it.
 - mentions (REQUIRED FIELD): for EVERY file reference in your reply, add {id, text} where `text` is the EXACT substring of your reply naming it, copied character-for-character — same spelling, same case, no trailing punctuation — so it can be found by plain string search. If your reply mentions three files, mentions has three entries. This is what turns your words into play/reveal buttons; a reference with no mentions entry is dead text to the user. Only ids from the candidate list. If the reply genuinely names no file, return an empty array.
@@ -1127,6 +1128,63 @@ MIDI_CAVEAT = (
 _MIDI_NAME = _re.compile(r"\.midi?\b", _re.I)
 
 
+# ── S28-B (ruled 2026-09-08) — A TYPED KEY IS A CONSTRAINT ────────────
+#
+# S28 fixed retrieval: with the typed key scored and a third ranking added,
+# the pool for "140 bpm loops in bb minor" went from 3 Bb-minor rows in 50
+# to 23. The model still returned five picks all at 140 BPM — two keyless,
+# two in a foreign key, one in Bb minor. Given 23 candidates satisfying
+# BOTH halves of the query it read the tempo and not the key.
+#
+# So the constraint lives here. A key the user typed is not a preference
+# to be weighed against tempo; it is the one thing in the query that makes
+# a file unusable when wrong, because a loop in the wrong key clashes the
+# moment it plays.
+#
+# WHAT IS NOT DROPPED: a KEYLESS pick. Half the library carries no key at
+# all (S19: 50.2%), and drums are mostly keyless and mostly unpitched — a
+# hi-hat loop is not in the wrong key, it is in no key. Dropping those
+# would delete the right answer for missing data, which is the exact
+# reasoning that made the key a term and never a predicate.
+#
+# The relative major/minor is kept for the reason S19 kept it: the same
+# seven notes.
+RELATIVE_SEMITONES = 3
+
+
+def key_matches_typed(candidate_key, typed):
+    """True when the candidate's key is absent (nothing to clash), the same
+    key, or its relative major/minor. Both sides arrive already parsed by
+    the client's canon parser, so this is arithmetic and there is no second
+    dialect to disagree with."""
+    if not isinstance(candidate_key, dict):
+        return True  # keyless — never a clash
+    pc, minor = candidate_key.get("pc"), candidate_key.get("minor")
+    if not isinstance(pc, int) or not isinstance(minor, bool):
+        return True  # unreadable — treated as keyless, never invented
+    tpc, tminor = typed.get("pc"), typed.get("minor")
+    if pc == tpc and minor == tminor:
+        return True
+    if tminor and not minor and (tpc + RELATIVE_SEMITONES) % 12 == pc:
+        return True
+    if not tminor and minor and (pc + RELATIVE_SEMITONES) % 12 == tpc:
+        return True
+    return False
+
+
+# When too few picks survive the constraint, the crate is kept whole and
+# the reply says which ones are off-key. Deleting the answer down to one
+# file is worse than an honest label: the user asked for Bb minor in a
+# library that may simply not have much, and a thin crate they can see is
+# more use than a crate that silently became two files.
+MIN_PICKS_AFTER_KEY_DROP = 3
+
+
+def _key_name(k):
+    ROOTS = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+    return f"{ROOTS[k['pc'] % 12]}{'m' if k.get('minor') else ''}"
+
+
 def needs_midi_caveat(reply, picked_ids, midi_ids):
     """True when the prose promises a warp over a crate that contains MIDI
     and never states the limit. Idempotent by construction."""
@@ -1150,6 +1208,13 @@ def search():
         return err, code
     candidates = data.get("candidates", [])
     conversation = data.get("conversation", [])
+    # S28-B — the key the user typed, already parsed by the client's canon
+    # parser. Absent or null means constrain nothing.
+    typed_key = data.get("typed_key")
+    if not (isinstance(typed_key, dict)
+            and isinstance(typed_key.get("pc"), int)
+            and isinstance(typed_key.get("minor"), bool)):
+        typed_key = None
 
     if not query:
         return jsonify({"error": "empty query"}), 400
@@ -1343,6 +1408,60 @@ def search():
             "detail": f"reply was {type(reply_val).__name__}, expected string",
             "usage": usage_out,
         }), 502
+
+    # S28-B — the typed-key constraint, applied before anything else reads
+    # the picks so every downstream count is the constrained one.
+    if typed_key is not None:
+        _by_id = {c.get("id"): c for c in candidates if isinstance(c, dict)}
+        _in_key, _off_key = [], []
+        for p in picks_raw:
+            if not isinstance(p, dict):
+                continue
+            cand = _by_id.get(p.get("id"), {})
+            (_in_key if key_matches_typed(cand.get("key"), typed_key) else _off_key).append(p)
+        if _off_key:
+            _names = [
+                str(_by_id.get(p.get("id"), {}).get("meta_text", ""))[:48]
+                for p in _off_key
+            ]
+            if len(_in_key) >= MIN_PICKS_AFTER_KEY_DROP:
+                print(
+                    f"[search] TYPED KEY {_key_name(typed_key)} — dropped {len(_off_key)} of "
+                    f"{len(picks_raw)} picks not in that key or its relative: {_names}",
+                    flush=True,
+                )
+                picks_raw = _in_key
+            else:
+                # Too few would survive: keep the crate and LABEL it, rather
+                # than deleting the answer down to one file.
+                #
+                # The label names the off-key picks BY THEIR KEYS, not by
+                # filename. The directive already forbids raw filenames in
+                # prose ("Long underscored filenames are unreadable
+                # mid-sentence"), and an appended sentence carries no
+                # mentions entry, so a filename here would be unreadable
+                # AND unclickable. The user sees the crate with its key
+                # badges, so "two are in Em and Am" points at them exactly.
+                _off_keys = []
+                for p in _off_key:
+                    k = _by_id.get(p.get("id"), {}).get("key")
+                    n = _key_name(k) if isinstance(k, dict) else None
+                    if n and n not in _off_keys:
+                        _off_keys.append(n)
+                _which = (
+                    f"{len(_off_key)} of these are in {', '.join(_off_keys)}"
+                    if _off_keys
+                    else f"{len(_off_key)} of these are in another key"
+                )
+                reply_val = reply_val.rstrip() + (
+                    f" Heads up — {_which}, not {_key_name(typed_key)}; "
+                    f"your library is thin on that key, so they are here as the closest fits."
+                )
+                print(
+                    f"[search] TYPED KEY {_key_name(typed_key)} — only {len(_in_key)} pick(s) in key, "
+                    f"below the floor of {MIN_PICKS_AFTER_KEY_DROP}: kept all {len(picks_raw)} and labelled",
+                    flush=True,
+                )
 
     # BATTERY-FIX A — the caveat, appended before anything reads the reply
     # (mention spans are validated against the FINAL text further down).
