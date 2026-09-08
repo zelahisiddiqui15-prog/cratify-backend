@@ -1329,7 +1329,47 @@ def search():
     # The client already treats an empty array as no-chips.
     mentions = parsed.get("mentions")
     if isinstance(mentions, list):
-        out["mentions"] = mentions
+        # BATTERY-FIX (ruled 2026-09-07) — VALIDATE THE SPANS AGAINST THE PROSE.
+        #
+        # A mention is a promise that `text` occurs in `reply`, because the
+        # client finds it by plain string search and draws a chip on the
+        # match. When it does not occur the chip is simply never drawn: the
+        # file silently stays dead text and NOTHING anywhere reports it.
+        #
+        # SEARCH-BATTERY's q01 capture is the evidence. The reply named no
+        # file at all — "Got some solid afrobeats drum loops for you. They
+        # all auto-snap to 116 BPM…" — and six spans came back with it:
+        # FireFly, soldier, afrrap, kemi groove, Banga Vibes, knocking.
+        # Filename fragments, none of them in the prose. Six chips the user
+        # was meant to get and did not, on a surface with no way to notice.
+        #
+        # The directive already asks for exact substrings (line ~250). This
+        # is the check that the ask was honoured, done HERE so a client that
+        # never runs the reply-shape guard is still protected.
+        kept, dropped = [], []
+        for m in mentions:
+            if not isinstance(m, dict):
+                dropped.append(repr(m)[:40])
+                continue
+            t = m.get("text")
+            if isinstance(t, str) and t.strip() != "" and t in reply_val:
+                kept.append(m)
+            else:
+                dropped.append(t if isinstance(t, str) else repr(t)[:40])
+        if dropped:
+            print(
+                f"[search] MENTIONS DROPPED {len(dropped)} of {len(mentions)} — "
+                f"span not present in the reply: {dropped}",
+                flush=True,
+            )
+        # NOT dropped, only reported: a span that occurs MORE than once is a
+        # different defect (one file silently standing in for another) and
+        # has not been ruled on. Counting it here gives that ruling data
+        # instead of an argument.
+        _dupes = [m.get("text") for m in kept if reply_val.count(m.get("text", "")) > 1]
+        if _dupes:
+            print(f"[search] MENTIONS AMBIGUOUS (kept, span occurs >1x): {_dupes}", flush=True)
+        out["mentions"] = kept
     print(f"[search] tool keys={sorted(parsed.keys())} mentions={len(mentions) if isinstance(mentions, list) else 'ABSENT'}", flush=True)
     return jsonify(out)
 
