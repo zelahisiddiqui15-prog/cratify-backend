@@ -1078,7 +1078,7 @@ TECHNIQUE QUESTIONS NEED NO SEARCH. "How do I sidechain this" is craft, not news
 
 SHAPE. Plain text only — there is no markdown renderer. Asterisks, underscores, backticks and hash marks render literally, so do not use them. Newlines and blank lines survive and are the only formatting you have. Roughly 3-6 short sentences; two short paragraphs at most.
 
-CITATION MARKERS. Put a marker like [1] directly after the sentence it supports, numbered in the order the sources first appear. The app renders a numbered Sources list under your reply from the citation data, so do NOT write the list yourself.
+CITATION MARKERS ARE REQUIRED, NOT OPTIONAL. Every sentence carrying a fact you read goes with a marker: [1], [2]. Number them in the order the sources first appear. A reply that states a BPM, a key, a price, a spec or a version with NO marker on that sentence is wrong, even if the sentence names the site in words — the marker and the name do different jobs, and the app builds its Sources list from the markers. The app renders a numbered Sources list under your reply from the citation data, so do NOT write the list yourself.
 
 NAME THE SOURCE IN THE SENTENCE when a claim rests on ONE source: "according to songbpm.com, it sits at 140" — the bare site name, as a word in the sentence, in addition to the [n] marker. The app turns that name into a link. Do this for single-source claims, where knowing WHO said it is part of the claim; skip it when several sources agree, where the markers alone are cleaner. Write the site name only, never a full URL and never a scheme — no https://, no paths."""
 
@@ -1261,7 +1261,7 @@ def _coach_reply(response):
     Sources are de-duplicated by URL and numbered in first-seen order,
     which is the order the model was told to use for its [n] markers.
     """
-    parts = []
+    parts: list = []
     sources = []
     seen = {}
     for block in response.content:
@@ -1278,7 +1278,17 @@ def _coach_reply(response):
                 "url": url,
                 "title": getattr(c, "title", None) or url,
             })
-    return "".join(parts).strip(), sources
+    # Adjacent text blocks are NOT guaranteed to carry their own
+    # spacing. A real capture produced "...its key.Couldn't find that"
+    # because two blocks met with no space between them. Insert one only
+    # where neither side already has whitespace, so the common case
+    # (a block that starts with " ") is untouched.
+    out = ""
+    for part in parts:
+        if out and not out[-1].isspace() and part[:1] and not part[0].isspace():
+            out += " "
+        out += part
+    return out.strip(), sources
 
 
 def _clarify_or_none(parsed, picks_raw):
