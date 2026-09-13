@@ -219,6 +219,8 @@ Guidelines for your response:
 - CONTEXT: the conversation history precedes the latest message. If the latest message is a follow-up ("okay how about vital?", "something darker", "more like that", "in F minor instead"), interpret it AS A REFINEMENT of the previous request in this thread — never as a cold literal search. "okay how about vital?" after a bass hunt means "that same bass search, but Vital presets." A follow-up inherits the instrument/vibe/context of what came before unless it clearly changes them.
 - CATEGORY: if the user names an instrument or category (drums, bass, pads, vocals, chords, keys, leads...), your picks MUST be of that category. A follow-up that names NO category inherits the category of the previous turn — "okay how about serum?" after a bass hunt means SERUM BASS presets, not whatever else Serum makes — unless the user names a new one, which replaces it. The candidate list is already weighted toward it. If you include an off-category pick, your reply MUST say why it earns its place ("threw in a pad since it doubles as a bass layer"). Otherwise, stay on-category.
 - picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
+- CLARIFY (rare): if the ask has TWO OR MORE genuinely different readings that would send you to different files, and choosing between them would be a coin flip, return `clarify` instead of picks and leave `picks` empty. Your reply must STATE THE READINGS you are choosing between, so the question is visibly earned — "chords could mean the progression or the one-shot stabs" — and then ask. Each option is phrased as the user would say it back, because it is sent verbatim as their next message.
+  NEVER clarify to stall, to be safe, or because an ask is broad. A broad ask gets your best picks. "Something dark" is broad, not ambiguous — answer it. "Something like my last one" with no history IS ambiguous. If you can rank the candidates at all, rank them.
 - reply: talk like a producer friend texting back — plain, warm, concrete.
   THE SHAPE OF THE REPLY IS SPECIFIED HERE AND NOWHERE ELSE. It used to be
   stated twice in the same request — "2-3 short sentences" here and "2-3
@@ -307,6 +309,35 @@ SEARCH_TOOL_SCHEMA = {
                     },
                     "required": ["step", "roman", "chord", "pick_ids"],
                 },
+            },
+            "clarify": {
+                "type": "object",
+                "description": (
+                    "OPTIONAL and RARE. Use ONLY when the ask has two or more genuinely "
+                    "different readings that would send you to different files, and picking "
+                    "one would be a coin flip. When you use it, `picks` MUST be empty and "
+                    "your `reply` MUST state the readings you are choosing between. Never "
+                    "use it to stall, to be safe, or because the ask is broad — a broad ask "
+                    "gets your best picks, not a question."
+                ),
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "One short question, in a producer's words. No preamble.",
+                    },
+                    "options": {
+                        "type": "array",
+                        "description": "2-3 readings, each phrased as the user would say it back — it is sent verbatim as their next message.",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 3,
+                    },
+                    "allow_other": {
+                        "type": "boolean",
+                        "description": "True when the readings may not cover it and a typed answer helps.",
+                    },
+                },
+                "required": ["question", "options", "allow_other"],
             },
             "mentions": {
                 "type": "array",
@@ -1216,6 +1247,50 @@ def _coach_reply(response):
     return "".join(parts).strip(), sources
 
 
+def _clarify_or_none(parsed, picks_raw):
+    """CLARIFY1 — validate a clarify block, or return None.
+
+    Refuses rather than repairs. A malformed clarify is a model that did
+    not follow the schema, and guessing what it meant would put an
+    invented question in front of a producer.
+
+    Rules, all of them the ruling's:
+      - never alongside picks (picks win; see the call site)
+      - 2 to 3 options, non-empty strings, de-duplicated
+      - a question that is actually a question
+    """
+    c = parsed.get("clarify")
+    if not isinstance(c, dict):
+        return None
+    if isinstance(picks_raw, list) and len(picks_raw) > 0:
+        print(f"[search] clarify DROPPED — it arrived with {len(picks_raw)} picks", flush=True)
+        return None
+    question = c.get("question")
+    if not isinstance(question, str) or question.strip() == "":
+        print("[search] clarify DROPPED — no question", flush=True)
+        return None
+    raw_options = c.get("options")
+    if not isinstance(raw_options, list):
+        print("[search] clarify DROPPED — options is not a list", flush=True)
+        return None
+    options = []
+    for o in raw_options:
+        if not isinstance(o, str):
+            continue
+        t = o.strip()
+        if t == "" or t in options:
+            continue
+        options.append(t)
+    if not (2 <= len(options) <= 3):
+        print(f"[search] clarify DROPPED — {len(options)} usable options", flush=True)
+        return None
+    return {
+        "question": question.strip(),
+        "options": options,
+        "allow_other": bool(c.get("allow_other")),
+    }
+
+
 @app.route("/usage", methods=["GET"])
 def usage():
     """METER1 — the honest-state surface: what this user has spent this
@@ -1718,8 +1793,20 @@ def search():
             flush=True,
         )
 
+    # CLARIFY1 (ruled 2026-09-13) — a question INSTEAD OF picks, never
+    # alongside them. The schema says so and the prompt says so; this
+    # ENFORCES it, because a model that returns both has not decided, and
+    # a client rendering both would ask a question over a list that
+    # already answered it.
+    #
+    # Picks win. Returning picks and dropping the question is the
+    # recoverable failure: the user gets an answer. Returning the
+    # question and dropping real picks throws away work they paid for.
+    clarify = _clarify_or_none(parsed, picks_raw)
+
     out = {
-        "picks": picks_raw,
+        "picks": [] if clarify else picks_raw,
+        "clarify": clarify,
         "filters_used": parsed.get("filters_used", {}) if isinstance(parsed.get("filters_used"), dict) else {},
         "reply": reply_val,
         "broad_count": 0,
