@@ -1027,7 +1027,9 @@ TECHNIQUE QUESTIONS NEED NO SEARCH. "How do I sidechain this" is craft, not news
 
 SHAPE. Plain text only — there is no markdown renderer. Asterisks, underscores, backticks and hash marks render literally, so do not use them. Newlines and blank lines survive and are the only formatting you have. Roughly 3-6 short sentences; two short paragraphs at most.
 
-CITATION MARKERS. Put a marker like [1] directly after the sentence it supports, numbered in the order the sources first appear. The app renders a numbered Sources list under your reply from the citation data, so do NOT write the list yourself and do not paste URLs into the prose."""
+CITATION MARKERS. Put a marker like [1] directly after the sentence it supports, numbered in the order the sources first appear. The app renders a numbered Sources list under your reply from the citation data, so do NOT write the list yourself.
+
+NAME THE SOURCE IN THE SENTENCE when a claim rests on ONE source: "according to songbpm.com, it sits at 140" — the bare site name, as a word in the sentence, in addition to the [n] marker. The app turns that name into a link. Do this for single-source claims, where knowing WHO said it is part of the claim; skip it when several sources agree, where the markers alone are cleaner. Write the site name only, never a full URL and never a scheme — no https://, no paths."""
 
 
 @app.route("/coach", methods=["POST"])
