@@ -1081,10 +1081,18 @@ def coach():
     try:
         response = _call(messages)
     except anthropic.BadRequestError as e:
-        # Almost always a stale or altered encrypted block. Retry ONCE
-        # with no history at all rather than handing the user a 400.
-        print(f"[coach] bad request, retrying without history: {e}", flush=True)
-        if not history:
+        # A 400 is NOT automatically a stale block. The first real capture
+        # attempt hit "credit balance is too low", which is also a 400 --
+        # and retrying that without history spends a second failing call
+        # and tells the user to reword a question that was fine.
+        #
+        # Only the block cases are retryable, and they name themselves.
+        msg = str(e).lower()
+        retryable = bool(history) and (
+            "encrypted" in msg or "content block" in msg or "tool_use" in msg
+        )
+        print(f"[coach] bad request (retryable={retryable}): {e}", flush=True)
+        if not retryable:
             return jsonify({"error": f"claude_failed: {e}"}), 500
         dropped = True
         try:
