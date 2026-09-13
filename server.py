@@ -399,7 +399,27 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "Cratify API"})
+    """Health, and WHICH BUILD is answering.
+
+    Added 2026-09-13 because every deploy so far was verified by
+    inference — "the route returns 401 instead of 405, so it must be
+    live". That works once and then stops: a change that alters no
+    route's existence (a prompt edit, a schema field, a retry rule) is
+    invisible from outside. Railway sets the commit sha in the
+    environment, so the deployed build can simply say what it is.
+
+    null when the variable is absent, never a guess.
+    """
+    sha = (
+        os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+        or os.environ.get("RAILWAY_SNAPSHOT_ID")
+        or os.environ.get("SOURCE_VERSION")
+    )
+    return jsonify({
+        "status": "ok",
+        "service": "Cratify API",
+        "commit": sha[:7] if isinstance(sha, str) and sha else None,
+    })
 
 
 @app.route("/auth/register", methods=["POST"])
