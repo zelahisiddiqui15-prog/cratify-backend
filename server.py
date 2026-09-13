@@ -1112,10 +1112,24 @@ def coach():
     # the context window. SEARCH_MODEL is Sonnet 4.6, which supports it;
     # on an older model this type is rejected and the basic
     # web_search_20250305 would be required instead.
+    # allowed_callers: ["direct"] IS THE CITATION REQUIREMENT.
+    #
+    # web_search_20260209 defaults to running search INSIDE code
+    # execution (dynamic filtering), which filters results before they
+    # reach the context window and costs fewer tokens. Measured on the
+    # first real capture: five calls, every one searched, and EVERY text
+    # block came back with zero citations — the model wrote prose from
+    # the filtered output rather than from citable result blocks.
+    #
+    # Ruling 3 requires a citation on every factual claim, so cheaper is
+    # not an option here. Calling search directly puts the results in
+    # context and returns web_search_result_location citations, which is
+    # what the Sources list and the [n] markers are built from.
     tools = [{
         "type": "web_search_20260209",
         "name": "web_search",
         "max_uses": COACH_MAX_SEARCHES,
+        "allowed_callers": ["direct"],
     }]
 
     def _call(msgs):
