@@ -135,6 +135,11 @@ def init_db():
     cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS suggest_count INTEGER DEFAULT 0")
     cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS intent_count INTEGER DEFAULT 0")
     cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS summarize_count INTEGER DEFAULT 0")
+    # WEB1 (ruled 2026-09-13) — /coach is its own spending endpoint, so it
+    # gets its own counter. Web search is billed PER SEARCH on top of
+    # tokens, which is why it can never share /search's meter: one coach
+    # answer can cost three searches.
+    cur.execute("ALTER TABLE usage_monthly ADD COLUMN IF NOT EXISTS coach_count INTEGER DEFAULT 0")
     # METER1b -- first-index library size, set once, on users: the growth
     # baseline. usage_monthly.library_size is the per-month time series.
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_library_size INTEGER")
@@ -232,12 +237,12 @@ def get_usage(user_id, month=None):
         "embed_count": 0, "classify_bg_count": 0,
         "classify_int_count": 0, "library_size": None,
         "search_count": 0, "describe_count": 0, "suggest_count": 0,
-        "intent_count": 0, "summarize_count": 0,
+        "intent_count": 0, "summarize_count": 0, "coach_count": 0,
     }
 
 
 def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None, search=0,
-              describe=0, suggest=0, intent=0, summarize=0):
+              describe=0, suggest=0, intent=0, summarize=0, coach=0):
     """Upsert-increment the month's counters. Instrumentation counts
     EVERYTHING — capped or not, background or interactive — because the
     point of deferring pricing is producing this data."""
@@ -248,8 +253,8 @@ def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None
         INSERT INTO usage_monthly (user_id, month, embed_count, classify_bg_count,
                                    classify_int_count, library_size, search_count,
                                    describe_count, suggest_count, intent_count,
-                                   summarize_count, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                   summarize_count, coach_count, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id, month) DO UPDATE SET
             embed_count = usage_monthly.embed_count + EXCLUDED.embed_count,
             classify_bg_count = usage_monthly.classify_bg_count + EXCLUDED.classify_bg_count,
@@ -260,10 +265,11 @@ def add_usage(user_id, embed=0, classify_bg=0, classify_int=0, library_size=None
             suggest_count = usage_monthly.suggest_count + EXCLUDED.suggest_count,
             intent_count = usage_monthly.intent_count + EXCLUDED.intent_count,
             summarize_count = usage_monthly.summarize_count + EXCLUDED.summarize_count,
+            coach_count = usage_monthly.coach_count + EXCLUDED.coach_count,
             updated_at = EXCLUDED.updated_at
         """,
         (user_id, month_key(), embed, classify_bg, classify_int,
-         library_size, search, describe, suggest, intent, summarize,
+         library_size, search, describe, suggest, intent, summarize, coach,
          datetime.utcnow().isoformat()),
     )
     if library_size is not None:

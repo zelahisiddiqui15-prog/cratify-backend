@@ -52,6 +52,12 @@ SUGGEST_MONTHLY_LIMIT = 3000
 DESCRIBE_MONTHLY_LIMIT = 500
 INTENT_MONTHLY_LIMIT = 2000
 SUMMARIZE_MONTHLY_LIMIT = 200
+# WEB1 (ruled 2026-09-13) — /coach's own ceiling, deliberately LOWER than
+# /search's 2000. A coach answer is billed per web search on top of
+# tokens ($10 per 1,000 searches), and max_uses is 3, so one call can
+# cost three searches. 300 is a real month of use at a cost ceiling that
+# cannot surprise anyone.
+COACH_MONTHLY_LIMIT = 300
 
 
 # ── AUTH1: identity comes from a session token ───────────────────────────
@@ -986,6 +992,220 @@ description text, no preamble."""
 # with zero callers in the Electron app, the plugin (rides the bridge),
 # or the website. Their usage counters/ceilings remain for history.
 
+# ── WEB1 (ruled 2026-09-13) — /coach ──────────────────────────────────
+#
+# A SEPARATE ENDPOINT, never a branch inside /search (ruled). The two
+# calls share nothing: /search forces one client tool and gets a
+# candidate list; /coach offers a SERVER tool and gets none. They also
+# cannot be combined — a forced tool_choice means the model must emit
+# that tool immediately, so a server tool never runs, and the API
+# explicitly does not run a server tool that lands in the same parallel
+# group as a client tool. Folding them together would put a branch
+# through the middle of the most expensive call we own.
+COACH_MODEL = SEARCH_MODEL
+COACH_MAX_OUTPUT_TOKENS = 2000
+# Ruled: three. A simple question takes 1-3 searches; this is the hard
+# ceiling on the per-search charge, not a hint.
+COACH_MAX_SEARCHES = 3
+# Ruled: the last 6 turns. Longer histories carry more encrypted result
+# blocks, every one of which is re-read as input tokens.
+COACH_MAX_TURNS = 6
+
+COACH_SYSTEM = """You are Cratify's producer coach. You are talking to a working music producer inside their sample app, and you can search the web.
+
+WHO YOU ARE TALKING TO. A producer mid-session. They want an answer they can act on in the next ten minutes, not an essay. Talk the way a more experienced producer would talk to them: plain, concrete, specific. No preamble, no "great question", no summarising what they asked.
+
+THEIR SESSION. The message may begin with a PROJECT block naming the key, the BPM and the tags of the song they are working on, and sometimes a CHANNELS block listing what is already in their DAW project. Use it when it is relevant — an answer about layering a kick should know what is already on the low end — and ignore it when it is not. Never recite it back at them.
+
+CITE EVERY FACTUAL CLAIM. Any statement about a product, a price, a version, a spec, a release, a person, or what some piece of software does goes with a citation from a search result. If you did not read it, do not say it.
+
+NEVER INVENT. No gear that does not exist, no prices you did not read, no version numbers you are guessing at. A plugin you are not sure about is one you say you are not sure about. Prices change and vary by region — quote them as what a source said, with the source, never as the current price.
+
+WHEN YOU FIND NOTHING. If the searches come back empty or none of it answers the question, say "Couldn't find that" and say what you did look for. Do not fill the gap from memory and do not apologise at length. Offering the nearest thing you DID find is useful; pretending it is the answer is not.
+
+TECHNIQUE QUESTIONS NEED NO SEARCH. "How do I sidechain this" is craft, not news — answer it directly from what you know. Search when the answer depends on something current or specific: a product, a price, a version, a release, a setting in a named piece of software.
+
+SHAPE. Plain text only — there is no markdown renderer. Asterisks, underscores, backticks and hash marks render literally, so do not use them. Newlines and blank lines survive and are the only formatting you have. Roughly 3-6 short sentences; two short paragraphs at most.
+
+CITATION MARKERS. Put a marker like [1] directly after the sentence it supports, numbered in the order the sources first appear. The app renders a numbered Sources list under your reply from the citation data, so do NOT write the list yourself and do not paste URLs into the prose."""
+
+
+@app.route("/coach", methods=["POST"])
+def coach():
+    """WEB1 — the producer coach, with web search. No library pool.
+
+    The client sends `blocks` for prior assistant turns: the content
+    blocks EXACTLY as we returned them, encrypted_content included. The
+    API decrypts them to restore search results on later turns, and a
+    modified or missing block is a 400. We never let that 400 reach a
+    user (ruled): a turn whose blocks are unusable is dropped from the
+    history and the answer is given fresh, with `dropped_history` set so
+    the client can say so.
+    """
+    data = request.get_json(force=True) or {}
+    query = (data.get("query") or "").strip()
+    err, code, _uid = meter_gate(data, "coach", "coach_count", COACH_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
+    if not query:
+        return jsonify({"error": "empty query"}), 400
+
+    history, dropped = _coach_history(data.get("conversation"))
+
+    anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    messages = history + [{"role": "user", "content": query}]
+    # web_search_20260209 adds dynamic filtering, which runs the search
+    # from inside code execution and filters results BEFORE they reach
+    # the context window. SEARCH_MODEL is Sonnet 4.6, which supports it;
+    # on an older model this type is rejected and the basic
+    # web_search_20250305 would be required instead.
+    tools = [{
+        "type": "web_search_20260209",
+        "name": "web_search",
+        "max_uses": COACH_MAX_SEARCHES,
+    }]
+
+    def _call(msgs):
+        return anthropic_client.messages.create(
+            model=COACH_MODEL,
+            max_tokens=COACH_MAX_OUTPUT_TOKENS,
+            thinking={"type": "disabled"},
+            system=[{"type": "text", "text": COACH_SYSTEM,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=msgs,
+            tools=tools,
+        )
+
+    try:
+        response = _call(messages)
+    except anthropic.BadRequestError as e:
+        # Almost always a stale or altered encrypted block. Retry ONCE
+        # with no history at all rather than handing the user a 400.
+        print(f"[coach] bad request, retrying without history: {e}", flush=True)
+        if not history:
+            return jsonify({"error": f"claude_failed: {e}"}), 500
+        dropped = True
+        try:
+            response = _call([{"role": "user", "content": query}])
+        except Exception as e2:
+            print(f"[coach] retry failed: {e2}", flush=True)
+            return jsonify({"error": f"claude_failed: {e2}"}), 500
+    except Exception as e:
+        print(f"[coach] claude call failed: {e}", flush=True)
+        return jsonify({"error": f"claude_failed: {e}"}), 500
+
+    # A long search turn can pause. Continue it by sending the paused
+    # assistant message back unchanged, bounded so a pathological turn
+    # cannot loop forever.
+    rounds = 0
+    while response.stop_reason == "pause_turn" and rounds < 4:
+        rounds += 1
+        messages = messages + [{"role": "assistant", "content": response.content}]
+        try:
+            response = _call(messages)
+        except Exception as e:
+            print(f"[coach] pause_turn continue failed: {e}", flush=True)
+            break
+
+    reply, sources = _coach_reply(response)
+    _u = response.usage
+    searches = 0
+    stu = getattr(_u, "server_tool_use", None)
+    if stu is not None:
+        searches = getattr(stu, "web_search_requests", 0) or 0
+    usage_out = {
+        "model": COACH_MODEL,
+        "input_tokens": _u.input_tokens,
+        "output_tokens": _u.output_tokens,
+        "cache_creation_input_tokens": getattr(_u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(_u, "cache_read_input_tokens", 0) or 0,
+        # The per-search charge. The client refuses to price a call whose
+        # usage is missing a field, so this is always reported — 0 is a
+        # real answer (a craft question needs no search).
+        "web_search_requests": searches,
+    }
+    print(f"[coach] usage {usage_out} sources={len(sources)}", flush=True)
+    add_usage(_uid, coach=1)
+    return jsonify({
+        "reply": reply,
+        "sources": sources,
+        # Returned verbatim for the client to persist and send back.
+        "blocks": [b.model_dump() for b in response.content],
+        "searched": searches > 0,
+        "dropped_history": dropped,
+        "usage": usage_out,
+    })
+
+
+def _coach_history(conversation):
+    """The last COACH_MAX_TURNS turns, with assistant turns restored from
+    their stored blocks. Returns (messages, dropped_any).
+
+    A stored assistant turn MUST go back as its original blocks or the
+    API rejects the request. A turn that kept only its text is not
+    continuable, so it is DROPPED rather than sent as plain text — a
+    silently truncated history is a wrong answer, and the caller is told.
+    """
+    if not isinstance(conversation, list):
+        return [], False
+    turns = conversation[-COACH_MAX_TURNS:]
+    out = []
+    dropped = False
+    for t in turns:
+        if not isinstance(t, dict):
+            dropped = True
+            continue
+        role = t.get("role")
+        if role == "user":
+            content = t.get("content")
+            if isinstance(content, str) and content.strip():
+                out.append({"role": "user", "content": content})
+            else:
+                dropped = True
+        elif role == "assistant":
+            blocks = t.get("blocks")
+            if isinstance(blocks, list) and blocks:
+                out.append({"role": "assistant", "content": blocks})
+            else:
+                # No blocks: this turn cannot be restored. Its user turn
+                # is already in `out`, and a user turn with no answer is
+                # still honest context, so only the assistant half goes.
+                dropped = True
+        else:
+            dropped = True
+    # An assistant turn cannot lead the history.
+    while out and out[0].get("role") != "user":
+        out.pop(0)
+        dropped = True
+    return out, dropped
+
+
+def _coach_reply(response):
+    """Plain-text reply plus the numbered source list.
+
+    Sources are de-duplicated by URL and numbered in first-seen order,
+    which is the order the model was told to use for its [n] markers.
+    """
+    parts = []
+    sources = []
+    seen = {}
+    for block in response.content:
+        if getattr(block, "type", None) != "text":
+            continue
+        parts.append(block.text)
+        for c in (getattr(block, "citations", None) or []):
+            url = getattr(c, "url", None)
+            if not url or url in seen:
+                continue
+            seen[url] = len(sources) + 1
+            sources.append({
+                "n": len(sources) + 1,
+                "url": url,
+                "title": getattr(c, "title", None) or url,
+            })
+    return "".join(parts).strip(), sources
+
+
 @app.route("/usage", methods=["GET"])
 def usage():
     """METER1 — the honest-state surface: what this user has spent this
@@ -1009,11 +1229,13 @@ def usage():
         "suggest_count": u.get("suggest_count", 0),
         "intent_count": u.get("intent_count", 0),
         "summarize_count": u.get("summarize_count", 0),
+        "coach_count": u.get("coach_count", 0),
         "first_library_size": (get_user(user_id) or {}).get("first_library_size"),
         "limits": {"embed": EMBED_MONTHLY_LIMIT, "classify": CLASSIFY_MONTHLY_LIMIT,
                    "search": SEARCH_MONTHLY_LIMIT, "suggest": SUGGEST_MONTHLY_LIMIT,
                    "describe": DESCRIBE_MONTHLY_LIMIT, "intent": INTENT_MONTHLY_LIMIT,
-                   "summarize": SUMMARIZE_MONTHLY_LIMIT},
+                   "summarize": SUMMARIZE_MONTHLY_LIMIT,
+                   "coach": COACH_MONTHLY_LIMIT},
         "embed_paused": u["embed_count"] >= EMBED_MONTHLY_LIMIT,
         "classify_paused": u["classify_bg_count"] >= CLASSIFY_MONTHLY_LIMIT,
     })
