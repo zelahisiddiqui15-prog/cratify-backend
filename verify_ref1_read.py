@@ -46,9 +46,12 @@ ok("...and the urls it did fetch are still reported", len(urls) == 1)
 r = resp([B(type="tool_use", name="report_reference",
             input={"found": False, "title": "Guess", "bpm": 120, "key": "C minor",
                    "genre": "house", "artist": "Nobody", "vibe": ["warm"],
-                   "source_url": "https://made.up/"})])
+                   "source_url": "https://made.up/", "mood": ["dark"],
+                   "instruments": ["log drums"], "era": "2020s",
+                   "signature_sounds": ["pitched bass"]})])
 f, _ = _reference_read(r)
-for field in ("title", "artist", "genre", "bpm", "key", "vibe", "source_url"):
+for field in ("title", "artist", "genre", "bpm", "key", "vibe", "source_url",
+              "mood", "instruments", "era", "signature_sounds"):
     ok(f"a not-found answer cannot smuggle a {field}", f.get(field) is None, repr(f.get(field)))
 
 r = resp([B(type="tool_use", name="something_else", input={"found": True, "title": "X"})])

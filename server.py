@@ -1389,6 +1389,31 @@ REFERENCE_TOOL = {
                 "items": {"type": "string"},
                 "description": "Up to 4 one-word feels, e.g. ['uplifting','warm'].",
             },
+            # REF2 — the PROFILE half. These are what a producer would
+            # need to go looking for sounds with, and they are the only
+            # fields here that describe the RECORD rather than identify
+            # it. Same null rule: unread is null.
+            "mood": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Up to 3 mood words for the record as a whole.",
+            },
+            "instruments": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Up to 5 instruments or sound sources a listener "
+                               "would actually name, e.g. ['log drums','shaker','piano'].",
+            },
+            "era": {
+                "type": ["string", "null"],
+                "description": "Decade or year, e.g. '2020s' or '2024'.",
+            },
+            "signature_sounds": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Up to 3 short phrases naming what makes this record "
+                               "sound like itself, e.g. ['pitched log-drum bass'].",
+            },
             "source_url": {
                 "type": ["string", "null"],
                 "description": "The result URL the musical facts came from.",
@@ -1414,6 +1439,8 @@ THEN CALL report_reference EXACTLY ONCE. That tool call is the answer. Do not wr
 NULL IS A REAL ANSWER, AND THE RIGHT ONE MORE OFTEN THAN YOU THINK. Every field you did not read in a search result is null. A BPM you half-remember is null. A key nobody stated is null. These fields are OFFERED to a producer as fill-ins for their own project, so an invented number is worse than an empty one — they may accept it without checking.
 
 FOUND MEANS IDENTIFIED. Set found true only when you know which track this is. If the link is dead, private, or resolves to nothing you can name, set found false and leave every other field null. Do not report a track you think it is "probably" like.
+
+DESCRIBE THE RECORD, NOT JUST ITS NUMBERS. mood, instruments, era and signature_sounds are what a producer would use to go looking for sounds. Name instruments a listener would actually name — "log drums", "shaker", "Rhodes" — not "percussion". signature_sounds is what makes this record sound like itself, in a few words. The SAME null rule applies: if you did not read it and cannot hear it named in a source, it is null.
 
 SOURCE. Put the URL the musical facts came from in source_url, copied from a search result, never typed from memory."""
 
@@ -1536,7 +1563,8 @@ def _reference_read(response):
     if not fields["found"]:
         # A not-found answer carrying facts is incoherent. Drop them
         # rather than let a half-answer reach a project field.
-        for k in ("title", "artist", "genre", "bpm", "key", "vibe", "source_url"):
+        for k in ("title", "artist", "genre", "bpm", "key", "vibe", "source_url",
+                  "mood", "instruments", "era", "signature_sounds"):
             fields[k] = None
     return fields, urls
 
