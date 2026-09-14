@@ -1335,6 +1335,212 @@ def _clarify_or_none(parsed, picks_raw):
     }
 
 
+# ── REF1 (ruled 2026-09-13) — /reference ──────────────────────────────
+#
+# A SEPARATE ENDPOINT, on WEB1's precedent and for WEB1's reason. It is
+# also NOT /describe_reference, which reads a timeline of MEASURED
+# features off an analysed audio file. This one takes a LINK or a TITLE
+# and asks the web who the track is. Same word, different jobs: one
+# listens to a file we have, the other looks up a record we do not.
+#
+# WHY IT EXISTS. The recon measured two of three real projects carrying
+# a reference link of the shape `watch?v=Z3aduh5fxCo` — a bare video id
+# with no title. The modal promises "a link helps by its title", and the
+# prompt was being handed an opaque string. Resolving it once turns that
+# string into "Title by Artist" for every later prompt.
+REF_MODEL = SEARCH_MODEL
+REF_MAX_OUTPUT_TOKENS = 1000
+# Ruled: two. A lookup is one identifying search plus at most one
+# follow-up for the musical facts. This is the hard ceiling on the
+# per-search charge, not a hint.
+REF_MAX_SEARCHES = 2
+# One lookup per link, cached client-side, so the ceiling is a safety
+# net rather than a budget the user spends against day to day.
+REF_MONTHLY_LIMIT = 200
+
+# The structured half. A client tool, NOT forced: a forced tool_choice
+# makes the model emit the tool immediately, which would mean it never
+# searches at all — the same trap WEB1 documented when it ruled /coach
+# and /search could not be combined.
+REFERENCE_TOOL = {
+    "name": "report_reference",
+    "description": (
+        "Report the track you identified. Call this exactly once, after "
+        "searching. Every field you did not actually read in a search "
+        "result must be null — a guess here becomes a number in the "
+        "producer's project."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "found": {
+                "type": "boolean",
+                "description": "True only if you identified the actual track.",
+            },
+            "title": {"type": ["string", "null"]},
+            "artist": {"type": ["string", "null"]},
+            "genre": {"type": ["string", "null"],
+                      "description": "One short genre, e.g. 'Afro house'."},
+            "bpm": {"type": ["integer", "null"]},
+            "key": {"type": ["string", "null"],
+                    "description": "Spelled for a producer: 'F minor', 'Bb major'."},
+            "vibe": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Up to 4 one-word feels, e.g. ['uplifting','warm'].",
+            },
+            "source_url": {
+                "type": ["string", "null"],
+                "description": "The result URL the musical facts came from.",
+            },
+            "note": {
+                "type": ["string", "null"],
+                "description": "One short sentence, only if something needs saying "
+                               "(e.g. sources disagree on the BPM). Otherwise null.",
+            },
+        },
+        "required": ["found"],
+    },
+}
+
+REF_SYSTEM = """You identify a music reference track from a link or a title, for a producer's project file.
+
+WHAT YOU GET. A line a producer pasted into their project's Reference field. It may be a full URL, a bare YouTube id like "watch?v=Z3aduh5fxCo", a "Title by Artist" string, or something vague. Your job is to say WHICH TRACK it is, and what its musical facts are.
+
+SEARCH FIRST, ALWAYS. You cannot know what a video id points at without looking it up, and you must not guess from the id's characters. If the line is already a clear "Title by Artist", search anyway to get the key and BPM.
+
+THEN CALL report_reference EXACTLY ONCE. That tool call is the answer. Do not write a prose reply instead of calling it.
+
+NULL IS A REAL ANSWER, AND THE RIGHT ONE MORE OFTEN THAN YOU THINK. Every field you did not read in a search result is null. A BPM you half-remember is null. A key nobody stated is null. These fields are OFFERED to a producer as fill-ins for their own project, so an invented number is worse than an empty one — they may accept it without checking.
+
+FOUND MEANS IDENTIFIED. Set found true only when you know which track this is. If the link is dead, private, or resolves to nothing you can name, set found false and leave every other field null. Do not report a track you think it is "probably" like.
+
+SOURCE. Put the URL the musical facts came from in source_url, copied from a search result, never typed from memory."""
+
+
+@app.route("/reference", methods=["POST"])
+def reference():
+    """REF1 — resolve one reference line to a track, structured.
+
+    Returns the tool's fields verbatim plus the URLs the API actually
+    fetched. The client composes the sentence the producer reads; this
+    endpoint returns facts, not prose, so the wording lives in one place
+    on the client and can be tested without a network.
+    """
+    data = request.get_json(force=True) or {}
+    line = (data.get("line") or "").strip()
+    err, code, _uid = meter_gate(data, "reference", "reference_count", REF_MONTHLY_LIMIT)
+    if err is not None:
+        return err, code
+    if not line:
+        return jsonify({"error": "empty line"}), 400
+
+    anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    tools = [
+        {
+            "type": "web_search_20260209",
+            "name": "web_search",
+            "max_uses": REF_MAX_SEARCHES,
+            # WEB1's finding, and it applies identically here: dynamic
+            # filtering runs the search inside code execution, and the
+            # results never reach the context window as citable blocks.
+            # We need the real result URLs, so the search runs direct.
+            "allowed_callers": ["direct"],
+        },
+        REFERENCE_TOOL,
+    ]
+    messages = [{"role": "user", "content": f"Reference line: {line}"}]
+
+    def _call(msgs):
+        return anthropic_client.messages.create(
+            model=REF_MODEL,
+            max_tokens=REF_MAX_OUTPUT_TOKENS,
+            thinking={"type": "disabled"},
+            system=[{"type": "text", "text": REF_SYSTEM,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=msgs,
+            tools=tools,
+        )
+
+    try:
+        response = _call(messages)
+    except Exception as e:
+        print(f"[reference] call failed: {e}", flush=True)
+        return jsonify({"error": f"claude_failed: {e}"}), 500
+
+    # A search turn can pause, and the model needs a turn AFTER the
+    # search to call the tool. Both are handled by sending the assistant
+    # message back unchanged, bounded so a pathological turn cannot loop.
+    rounds = 0
+    while response.stop_reason == "pause_turn" and rounds < 4:
+        rounds += 1
+        messages = messages + [{"role": "assistant", "content": response.content}]
+        try:
+            response = _call(messages)
+        except Exception as e:
+            print(f"[reference] pause_turn continue failed: {e}", flush=True)
+            break
+
+    found_tool, searched_urls = _reference_read(response)
+
+    _u = response.usage
+    stu = getattr(_u, "server_tool_use", None)
+    searches = (getattr(stu, "web_search_requests", 0) or 0) if stu is not None else 0
+    usage_out = {
+        "model": REF_MODEL,
+        "input_tokens": _u.input_tokens,
+        "output_tokens": _u.output_tokens,
+        "cache_creation_input_tokens": getattr(_u, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(_u, "cache_read_input_tokens", 0) or 0,
+        "web_search_requests": searches,
+    }
+    print(f"[reference] line={line[:80]!r} found={found_tool.get('found')} "
+          f"usage={usage_out} urls={len(searched_urls)}", flush=True)
+    add_usage(_uid, reference=1)
+    return jsonify({
+        "reference": found_tool,
+        # The URLs the API actually fetched. source_url is validated
+        # against these on the client, so a URL the model typed from
+        # memory cannot become a citation.
+        "searched_urls": searched_urls,
+        "searched": searches > 0,
+        "usage": usage_out,
+    })
+
+
+def _reference_read(response):
+    """(tool input, result urls) from a /reference response.
+
+    A model that searched but never called the tool is NOT an error: it
+    is a lookup that found nothing, which is a state the producer is
+    allowed to see. It is reported as found=false rather than dressed up.
+    """
+    fields = None
+    urls = []
+    for block in response.content:
+        btype = getattr(block, "type", None)
+        if btype == "tool_use" and getattr(block, "name", None) == "report_reference":
+            raw = getattr(block, "input", None)
+            if isinstance(raw, dict):
+                fields = raw
+        elif btype == "web_search_tool_result":
+            for r in (getattr(block, "content", None) or []):
+                u = getattr(r, "url", None)
+                t = getattr(r, "title", None)
+                if u and u not in [x["url"] for x in urls]:
+                    urls.append({"url": u, "title": t or u})
+    if fields is None:
+        return {"found": False, "note": "The model searched but did not identify a track."}, urls
+    # found is the only required field; normalise it rather than trust it.
+    fields["found"] = bool(fields.get("found"))
+    if not fields["found"]:
+        # A not-found answer carrying facts is incoherent. Drop them
+        # rather than let a half-answer reach a project field.
+        for k in ("title", "artist", "genre", "bpm", "key", "vibe", "source_url"):
+            fields[k] = None
+    return fields, urls
+
+
 @app.route("/usage", methods=["GET"])
 def usage():
     """METER1 — the honest-state surface: what this user has spent this
@@ -1364,7 +1570,8 @@ def usage():
                    "search": SEARCH_MONTHLY_LIMIT, "suggest": SUGGEST_MONTHLY_LIMIT,
                    "describe": DESCRIBE_MONTHLY_LIMIT, "intent": INTENT_MONTHLY_LIMIT,
                    "summarize": SUMMARIZE_MONTHLY_LIMIT,
-                   "coach": COACH_MONTHLY_LIMIT},
+                   "coach": COACH_MONTHLY_LIMIT,
+                   "reference": REF_MONTHLY_LIMIT},
         "embed_paused": u["embed_count"] >= EMBED_MONTHLY_LIMIT,
         "classify_paused": u["classify_bg_count"] >= CLASSIFY_MONTHLY_LIMIT,
     })
