@@ -4,9 +4,9 @@ server.py cannot be imported here (its deps live on Railway), so the
 function is lifted out of the REAL source by AST and executed. That is
 deliberately not a copy: if the source changes, this runs the change.
 """
-import ast, sys, types
+import ast, os, sys, types
 
-SRC = "/Users/zee/Desktop/SORT DROP/SortDrop_Code/cratify-backend/server.py"
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
 tree = ast.parse(open(SRC).read())
 fn = next((n for n in tree.body
            if isinstance(n, ast.FunctionDef) and n.name == "_reference_read"), None)
