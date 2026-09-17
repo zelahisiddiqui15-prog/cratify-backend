@@ -7,9 +7,9 @@ these questions first now; this is the belt for when one slips past.
 
 Lifted from the REAL source so a deleted directive fails here.
 """
-import ast, sys
+import ast, os, sys
 
-SRC = "/Users/zee/Desktop/SORT DROP/SortDrop_Code/cratify-backend/server.py"
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
 tree = ast.parse(open(SRC).read())
 directives = None
 for node in tree.body:
