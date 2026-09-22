@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import anthropic
@@ -17,7 +18,7 @@ from models import (init_db, create_user, get_user, get_user_by_email,
                     get_usage, add_usage, month_key,
                     deactivate_subscription, set_stripe_customer,
                     verify_password, create_session, session_user_id,
-                    revoke_session)
+                    revoke_session, add_support_request, support_requests_this_week)
 import time
 
 load_dotenv()
@@ -1623,6 +1624,52 @@ def usage_report():
         return jsonify({"error": "user not found"}), 404
     add_usage(user_id, library_size=size)
     return jsonify({"ok": True})
+
+
+# SUPPORT1 (b) (2026-09-21) — a producer asks for a file type. Shape only:
+# the client sends extensions, counts and the registry's plugin name, and
+# is refused anything else. Metered per user per week because a button
+# that can be pressed repeatedly is a button that needs a ceiling; the
+# client already refuses to re-ask an extension inside the week, so this
+# is the backstop, not the rule.
+SUPPORT_REQUESTS_PER_WEEK = 60
+_EXT_RE = re.compile(r"^\.[a-z0-9]{1,12}$")
+
+
+@app.route("/support/request", methods=["POST"])
+def support_request():
+    data = request.json or {}
+    user_id, err, code = request_identity(data)
+    if err is not None:
+        return err, code
+    if not get_user(user_id):
+        return jsonify({"error": "user not found"}), 404
+    raw = data.get("extensions")
+    if not isinstance(raw, list) or not raw or len(raw) > 20:
+        return jsonify({"error": "extensions (1-20) required"}), 400
+    items = []
+    for it in raw:
+        if not isinstance(it, dict):
+            return jsonify({"error": "bad item"}), 400
+        ext = it.get("ext")
+        count = it.get("count")
+        plugin = it.get("plugin")
+        if not isinstance(ext, str) or not _EXT_RE.match(ext):
+            return jsonify({"error": "bad extension"}), 400
+        if not isinstance(count, int) or count <= 0:
+            return jsonify({"error": "bad count"}), 400
+        if plugin is not None and (not isinstance(plugin, str) or len(plugin) > 64):
+            return jsonify({"error": "bad plugin"}), 400
+        # Anything that looks like a path or a filename is refused, not
+        # trimmed: the client is not supposed to have sent it.
+        if "/" in ext or "/" in (plugin or ""):
+            return jsonify({"error": "no paths"}), 400
+        items.append({"ext": ext, "count": count, "plugin": plugin})
+    if support_requests_this_week(user_id) + len(items) > SUPPORT_REQUESTS_PER_WEEK:
+        return jsonify({"error": "weekly support-request ceiling reached"}), 429
+    app_version = data.get("app_version")
+    add_support_request(user_id, items, app_version if isinstance(app_version, str) else None)
+    return jsonify({"ok": True, "recorded": len(items)})
 
 
 @app.route("/embed", methods=["POST"])

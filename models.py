@@ -147,6 +147,21 @@ def init_db():
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS first_library_size INTEGER")
     # AUTH1 — sessions: opaque bearer tokens, one row per login.
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_requests (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            ext TEXT NOT NULL,
+            file_count INTEGER NOT NULL,
+            plugin TEXT,
+            app_version TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    # SUPPORT1 (b) (2026-09-21) — one row per (user, extension, ask). The
+    # payload is the SHAPE of what the client could not read — extension,
+    # count, the plugin the registry implies — and never a path or a
+    # filename. Read manually for now (a dashboard is a different gate).
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -314,3 +329,33 @@ def set_stripe_customer(user_id, stripe_customer_id):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def add_support_request(user_id, items, app_version):
+    """SUPPORT1 (b) — record what a client asked support for. `items` is
+    [{ext, count, plugin}] and nothing else is stored."""
+    conn = get_db()
+    cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
+    for it in items:
+        cur.execute(
+            "INSERT INTO support_requests (user_id, ext, file_count, plugin, app_version, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+            (user_id, it["ext"], int(it["count"]), it.get("plugin"), app_version, now),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def support_requests_this_week(user_id):
+    """The ceiling's input: asks from this user in the last 7 days."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM support_requests WHERE user_id = %s AND created_at > %s",
+        (user_id, (datetime.utcnow() - __import__("datetime").timedelta(days=7)).isoformat()),
+    )
+    n = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return int(n)
