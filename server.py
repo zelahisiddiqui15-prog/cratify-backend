@@ -219,6 +219,10 @@ Guidelines for your response:
 - PERSONALIZATION: the query may begin with a "USER PREFERENCES" block and/or a "RECENT CORRECTIONS IN THIS CHAT" block. Treat every preference line as a standing instruction — check your response against each before finalizing. Preferences shape tone, pick ORDERING (e.g. "show Orbit samples first when they match" = lead with matching Orbit-pack files where they genuinely fit), and explanation style. They are best-effort ranking hints, NOT hard filters, and they NEVER override truthfulness — a preference cannot invent a match or reorder in a sound that does not fit. Honor RECENT CORRECTIONS literally: do not repeat a mistake the user just thumbed down.
 - CONTEXT: the conversation history precedes the latest message. If the latest message is a follow-up ("okay how about vital?", "something darker", "more like that", "in F minor instead"), interpret it AS A REFINEMENT of the previous request in this thread — never as a cold literal search. "okay how about vital?" after a bass hunt means "that same bass search, but Vital presets." A follow-up inherits the instrument/vibe/context of what came before unless it clearly changes them.
 - CATEGORY: if the user names an instrument or category (drums, bass, pads, vocals, chords, keys, leads...), your picks MUST be of that category. A follow-up that names NO category inherits the category of the previous turn — "okay how about serum?" after a bass hunt means SERUM BASS presets, not whatever else Serum makes — unless the user names a new one, which replaces it. The candidate list is already weighted toward it. If you include an off-category pick, your reply MUST say why it earns its place ("threw in a pad since it doubles as a bass layer"). Otherwise, stay on-category.
+- FILE KIND, AND SAYING WHEN YOU TRADED ONE CONSTRAINT FOR ANOTHER (REASON1, ruled 2026-09-26). When the ask names NO file kind — "a punchy kick drum", not "kick presets" — AUDIO COMES FIRST. Samples are what a producer drops on a timeline; a preset needs the plugin open. You MAY prefer samples.
+  BUT YOU MUST SAY SO. Measured on this library: the ask "Give me a punchy kick drum" returned eight kicks at high confidence and NOT ONE of them was tagged punchy, because the only three punchy kicks in the library are Nexus PRESETS. Both readings were defensible; the silence was not. The producer saw eight confident answers and no hint that the adjective had been dropped.
+  So whenever you satisfy the NOUN by giving up an ADJECTIVE the user named — or the reverse — put it in `unmet` in their own words: "the only punchy kicks I have are Nexus presets". One short phrase. Do not bury it, do not pad it, and do not present the near-misses as though they were what was asked for.
+  This applies to every kind of trade, not just presets: a key you could not match, a tempo nothing sits at, a mood nothing carries. If the crate does not answer the whole ask, `unmet` is where the missing half goes.
 - picks: identify the 4-8 best actual matches. If fewer than 4 truly match, return fewer. If nothing matches well, return empty list.
 - CLARIFY (rare): if the ask has TWO OR MORE genuinely different readings that would send you to different files, and choosing between them would be a coin flip, return `clarify` instead of picks and leave `picks` empty. Your reply must STATE THE READINGS you are choosing between, so the question is visibly earned — "chords could mean the progression or the one-shot stabs" — and then ask. Each option is phrased as the user would say it back, because it is sent verbatim as their next message.
   NEVER clarify to stall, to be safe, or because an ask is broad. A broad ask gets your best picks. "Something dark" is broad, not ambiguous — answer it. "Something like my last one" with no history IS ambiguous. If you can rank the candidates at all, rank them.
@@ -358,6 +362,32 @@ SEARCH_TOOL_SCHEMA = {
                     "required": ["id", "text"],
                 },
             },
+            # REASON1 (d), ruled 2026-09-26 — LET IT SAY THE LIBRARY HAS
+            # NOTHING, instead of composing around the gap.
+            #
+            # Measured on the desktop side (REASON1 recon, last 30 real asks):
+            # picks satisfied a typed key 100% of the time and a named
+            # category 93%, but nothing checked either, and when the pool
+            # held nothing that fit there was no field in which to say so —
+            # only prose, which the app cannot read. The battery's one
+            # reply-facing rule ("an honest 'none found'") had to be scored
+            # with a REGEX over the reply for exactly this reason.
+            #
+            # OUTPUT TOKENS ONLY. No extra call, no second model pass: the
+            # picks and the reply are already composed together, so the model
+            # knows what it could not satisfy at the moment it writes them.
+            "unmet": {
+                "type": "array",
+                "description": (
+                    "Constraints the USER NAMED that NOTHING in the candidates satisfies. "
+                    "One short phrase each, in the user's own terms: 'no Gm loops', "
+                    "'nothing tagged airy', 'no country vocals'. Leave EMPTY when the "
+                    "picks do satisfy the ask — this is not a place for hedging. "
+                    "When it is non-empty, say so plainly in the reply too, rather than "
+                    "presenting near-misses as though they were what was asked for."
+                ),
+                "items": {"type": "string"},
+            },
             "filters_used": {
                 "type": "object",
                 "description": "Broader filter criteria the user might want (for 'see more' button).",
@@ -377,7 +407,11 @@ SEARCH_TOOL_SCHEMA = {
                 },
             },
         },
-        "required": ["picks", "reply", "filters_used", "mentions"],
+        # `unmet` is REQUIRED so an empty list is an explicit "everything the
+        # ask named is satisfied" rather than a field the model forgot. An
+        # optional field would make silence ambiguous, which is the thing this
+        # is for.
+        "required": ["picks", "reply", "filters_used", "mentions", "unmet"],
     },
 }
 
@@ -2133,11 +2167,25 @@ def search():
     # question and dropping real picks throws away work they paid for.
     clarify = _clarify_or_none(parsed, picks_raw)
 
+    # REASON1 (d) — what the ask named that the candidates could not satisfy,
+    # in the model's own words. Normalised to a list of non-empty strings: the
+    # client reads this to say the gap plainly, and a malformed field must read
+    # as "nothing unmet" rather than crash a search the user already paid for.
+    unmet_raw = parsed.get("unmet")
+    unmet_out = (
+        [u.strip() for u in unmet_raw if isinstance(u, str) and u.strip()]
+        if isinstance(unmet_raw, list)
+        else []
+    )
+    if unmet_out:
+        print(f"[search] UNMET {unmet_out}", flush=True)
+
     out = {
         "picks": [] if clarify else picks_raw,
         "clarify": clarify,
         "filters_used": parsed.get("filters_used", {}) if isinstance(parsed.get("filters_used"), dict) else {},
         "reply": reply_val,
+        "unmet": unmet_out,
         "broad_count": 0,
         "usage": usage_out,
     }
