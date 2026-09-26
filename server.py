@@ -358,6 +358,32 @@ SEARCH_TOOL_SCHEMA = {
                     "required": ["id", "text"],
                 },
             },
+            # REASON1 (d), ruled 2026-09-26 — LET IT SAY THE LIBRARY HAS
+            # NOTHING, instead of composing around the gap.
+            #
+            # Measured on the desktop side (REASON1 recon, last 30 real asks):
+            # picks satisfied a typed key 100% of the time and a named
+            # category 93%, but nothing checked either, and when the pool
+            # held nothing that fit there was no field in which to say so —
+            # only prose, which the app cannot read. The battery's one
+            # reply-facing rule ("an honest 'none found'") had to be scored
+            # with a REGEX over the reply for exactly this reason.
+            #
+            # OUTPUT TOKENS ONLY. No extra call, no second model pass: the
+            # picks and the reply are already composed together, so the model
+            # knows what it could not satisfy at the moment it writes them.
+            "unmet": {
+                "type": "array",
+                "description": (
+                    "Constraints the USER NAMED that NOTHING in the candidates satisfies. "
+                    "One short phrase each, in the user's own terms: 'no Gm loops', "
+                    "'nothing tagged airy', 'no country vocals'. Leave EMPTY when the "
+                    "picks do satisfy the ask — this is not a place for hedging. "
+                    "When it is non-empty, say so plainly in the reply too, rather than "
+                    "presenting near-misses as though they were what was asked for."
+                ),
+                "items": {"type": "string"},
+            },
             "filters_used": {
                 "type": "object",
                 "description": "Broader filter criteria the user might want (for 'see more' button).",
@@ -377,7 +403,11 @@ SEARCH_TOOL_SCHEMA = {
                 },
             },
         },
-        "required": ["picks", "reply", "filters_used", "mentions"],
+        # `unmet` is REQUIRED so an empty list is an explicit "everything the
+        # ask named is satisfied" rather than a field the model forgot. An
+        # optional field would make silence ambiguous, which is the thing this
+        # is for.
+        "required": ["picks", "reply", "filters_used", "mentions", "unmet"],
     },
 }
 
@@ -2133,11 +2163,25 @@ def search():
     # question and dropping real picks throws away work they paid for.
     clarify = _clarify_or_none(parsed, picks_raw)
 
+    # REASON1 (d) — what the ask named that the candidates could not satisfy,
+    # in the model's own words. Normalised to a list of non-empty strings: the
+    # client reads this to say the gap plainly, and a malformed field must read
+    # as "nothing unmet" rather than crash a search the user already paid for.
+    unmet_raw = parsed.get("unmet")
+    unmet_out = (
+        [u.strip() for u in unmet_raw if isinstance(u, str) and u.strip()]
+        if isinstance(unmet_raw, list)
+        else []
+    )
+    if unmet_out:
+        print(f"[search] UNMET {unmet_out}", flush=True)
+
     out = {
         "picks": [] if clarify else picks_raw,
         "clarify": clarify,
         "filters_used": parsed.get("filters_used", {}) if isinstance(parsed.get("filters_used"), dict) else {},
         "reply": reply_val,
+        "unmet": unmet_out,
         "broad_count": 0,
         "usage": usage_out,
     }
