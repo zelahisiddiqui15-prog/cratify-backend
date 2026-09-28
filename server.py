@@ -26,7 +26,46 @@ load_dotenv()
 # --- Gate BE1 --- model ids in ONE place per tier, and the /search
 # stable prefix hoisted to module level: it must be a byte-stable prefix
 # for prompt caching to have anything to match on.
-SMALL_MODEL = "claude-haiku-4-5-20251001"
+#
+# MODEL1 (ruled 2026-09-27) — THE MODEL IS AN ENV VAR, NEVER A REQUEST FIELD.
+#
+# Zee: "Model override: build it server-side only (env/config on Railway), never
+# chosen by the client." The reason is the meter, not taste: `meter_gate` counts
+# calls by KIND, not by model price, so a client-chosen model would let a caller
+# bill Opus against a Sonnet allowance. Only /classify_batch ever read a model
+# from the request body, and that stays as it is — it is bounded by the same
+# allowlist below.
+#
+# An unknown value FAILS LOUD at import rather than at the first call: a typo in
+# a Railway variable should break the deploy, not silently answer every search
+# with a 400 from the API.
+MODEL_ALLOWLIST = {
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-opus-5-5",
+}
+
+
+def _model(env_name, default):
+    chosen = os.environ.get(env_name) or default
+    if chosen not in MODEL_ALLOWLIST:
+        raise RuntimeError(
+            f"{env_name}={chosen!r} is not in MODEL_ALLOWLIST — refusing to start "
+            f"rather than answer every call with an API error. Allowed: {sorted(MODEL_ALLOWLIST)}"
+        )
+    return chosen
+
+
+# CRATIFY_SMALL_MODEL — WARNING, and verify_model1_models.py enforces it. The five
+# small-model calls (/classify, /classify_batch, /classify_preset,
+# /suggest_prompts, /describe_reference) do NOT pass `thinking`, which is safe
+# only while this is Haiku. Sonnet 5 and Opus 5.5 run ADAPTIVE thinking when the
+# parameter is omitted, so pointing this at either without adding
+# thinking={"type": "disabled"} to those five calls quietly buys thinking tokens
+# on every labelling call — on a job whose whole appeal is $0.0008 each.
+SMALL_MODEL = _model("CRATIFY_SMALL_MODEL", "claude-haiku-4-5-20251001")
 
 # ── METER1: monthly ceilings for BACKGROUND work ─────────────────────────
 # RECOMMENDED NUMBERS (Zee approves before deploy — see the gate report):
@@ -203,7 +242,12 @@ def postprocess_result(result, filename):
 # request costs ~22% MORE on Sonnet 5, permanently.
 # Also note: Sonnet 5 runs ADAPTIVE thinking when `thinking` is omitted,
 # unlike 4.6 — see the explicit {"type": "disabled"} at the /search call.
-SEARCH_MODEL = "claude-sonnet-4-6"
+# MODEL1 — Sonnet 4.6 is LEGACY at $3/$15; Sonnet 5 is $2/$10. Same tier, 33%
+# cheaper, on 89% of the spend ($10.03 of $11.28 a month). Priced from a real
+# call's own tokens, reproducing the ledger's $0.04602 to five decimals.
+# `thinking` is explicitly disabled at all three call sites, so this swap does
+# not quietly turn on Sonnet 5's adaptive thinking.
+SEARCH_MODEL = _model("CRATIFY_SEARCH_MODEL", "claude-sonnet-5")
 # SONG1 S18 (ruled 2026-09-03) — ONE ceiling, so the limit, the
 # truncation message and the usage report can never disagree about what
 # the budget was. Raised 2000 -> 4000 after production truncation; output
@@ -457,6 +501,15 @@ def health():
         "status": "ok",
         "service": "Cratify API",
         "commit": sha[:7] if isinstance(sha, str) and sha else None,
+        # MODEL1 — which MODELS are serving, for the same reason the commit is
+        # here: a model swap alters no route's existence, so it is invisible from
+        # outside. An A/B that cannot confirm which arm is deployed is not an A/B.
+        "models": {
+            "search": SEARCH_MODEL,
+            "coach": COACH_MODEL,
+            "reference": REF_MODEL,
+            "small": SMALL_MODEL,
+        },
     })
 
 
@@ -1091,7 +1144,7 @@ description text, no preamble."""
 # explicitly does not run a server tool that lands in the same parallel
 # group as a client tool. Folding them together would put a branch
 # through the middle of the most expensive call we own.
-COACH_MODEL = SEARCH_MODEL
+COACH_MODEL = _model("CRATIFY_COACH_MODEL", SEARCH_MODEL)
 COACH_MAX_OUTPUT_TOKENS = 2000
 # Ruled: three. A simple question takes 1-3 searches; this is the hard
 # ceiling on the per-search charge, not a hint.
@@ -1386,7 +1439,7 @@ def _clarify_or_none(parsed, picks_raw):
 # with no title. The modal promises "a link helps by its title", and the
 # prompt was being handed an opaque string. Resolving it once turns that
 # string into "Title by Artist" for every later prompt.
-REF_MODEL = SEARCH_MODEL
+REF_MODEL = _model("CRATIFY_REF_MODEL", SEARCH_MODEL)
 REF_MAX_OUTPUT_TOKENS = 1000
 # Ruled: two. A lookup is one identifying search plus at most one
 # follow-up for the musical facts. This is the hard ceiling on the
