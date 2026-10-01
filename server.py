@@ -322,6 +322,67 @@ You MUST respond by calling the return_search_results tool. Do not respond with 
 The user's library samples (pre-ranked by similarity, ID in brackets):
 """
 
+# ── FIT2 (ruled 2026-09-28) — THE FIT, WHERE THE MODEL CAN READ IT ──────
+#
+# RANK2 gave every candidate an explicit fit score with named components and
+# ordered all fifty by it. The model never saw the number. It received
+# `[id] filename — description — duration` and a list whose ORDER carried a
+# judgement it had no way to read, so it re-decided from the text: measured on
+# q01, the fit had the afro loops roughly 2:1 above the disco/funk breaks
+# (0.0316-0.0326 against 0.0131-0.0174) and the model took the breaks.
+#
+# Zee: "send each candidate's fit components to the model with its row
+# ('afro ✓ · 150 ✓ · Gm ✓', fit 0.032) and tell it to prefer higher fit unless
+# the ask says otherwise, naming the trade in `unmet`."
+#
+# THIS BLOCK IS SENT ONLY WHEN THE CLIENT ACTUALLY SENDS FIT, and that is not a
+# convenience — it is what makes the A/B honest. The measurement runs two
+# desktop builds against ONE backend: the pre-FIT2 arm sends no `fit` key, and
+# it must receive the prompt it receives in production today, byte for byte. A
+# directive describing a field that is not there would confound the control and
+# would also be a live lie for the installed app, which predates FIT2.
+# verify_fit2_prompt.py holds both halves.
+#
+# It is a SEPARATE system block placed AFTER the cached one, so the cached
+# prefix is identical in both arms and the arms cannot differ on cache pricing.
+FIT_DIRECTIVES = """ABOUT `fit` ON EACH ROW BELOW:
+
+Every candidate carries `fit`, a number this app computed for THIS song before you saw the list, and the named components behind it. The components are the song's own facts: the key you see in `Gm ✓` is the project's key, `150 ✓` is the project's tempo, and a word like `afro ✓` is one of the project's own vibe tags or its reference track's profile. A `✗` is a clash that cost the row — `128 ✗` means the file sits at 128 against a project that is not at 128. The list is already ordered by this number, best first.
+
+PREFER HIGHER FIT. Between two candidates that both answer the ask, take the one with the better fit — it is the one that will drop into their project and work. Do not re-sort the list from the filenames; the fit already knows things the filename does not.
+
+UNLESS THE ASK SAYS OTHERWISE, and then the ask wins outright. A fit is what suits the song they have; the ask is what they want next. "Something in a different key", "half tempo", "something that does not sound like the rest of this" — every one of those is a deliberate move away from the project, and a high fit is the wrong answer to it. The user's words outrank this number every time. So does a hard constraint they named: a key they typed, a category they asked for.
+
+AND WHEN YOU GO LOW ON PURPOSE, SAY SO IN `unmet`. If you pass over better-fitting candidates — because the ask asked you to, or because nothing that fits actually answers it — name the trade in their own words: "these are the only 808s I have, none of them are at your tempo". That is the same rule as REASON1 above: satisfying one half of an ask by giving up the other is fine, and silence about it is not.
+
+Never mention the number itself, the word "fit", or a component's ✓/✗ in your reply. Say the musical thing it means — "already sits at your tempo", "in your key" — or say nothing.
+"""
+
+
+def render_search_candidates(candidates):
+    """The candidate list exactly as the model reads it.
+
+    Pure, and separated from the request handler so a guard can prove the ONE
+    property the A/B depends on: a payload with no `fit` renders byte-for-byte
+    what production renders today. Returns (text, fit_seen).
+    """
+    lines = []
+    fit_seen = False
+    for c in candidates[:50]:
+        line = f"[{c['id']}] {c['meta_text']}"
+        fit = c.get("fit") if isinstance(c, dict) else None
+        if isinstance(fit, dict) and isinstance(fit.get("total"), (int, float)):
+            fit_seen = True
+            why = fit.get("why")
+            why = why.strip() if isinstance(why, str) else ""
+            # A row where no component fired says so. "fit 0.00000 ()" would
+            # read as a rendering bug and invite the model to distrust the
+            # whole field.
+            line += f"  |  fit {fit['total']:+.4f}" + (f" ({why})" if why else " (no component matched)")
+        lines.append(line)
+    return "\n".join(lines), fit_seen
+
+
 SEARCH_TOOL_SCHEMA = {
     "name": "return_search_results",
     "description": "Return ranked sample picks with an explanation and inferred filters.",
@@ -1952,10 +2013,9 @@ def search():
             "broad_count": 0,
         })
 
-    candidates_text = "\n".join(
-        f"[{c['id']}] {c['meta_text']}"
-        for c in candidates[:50]
-    )
+    # FIT2 — one renderer, and it reports whether the client sent any fit at
+    # all. See FIT_DIRECTIVES above for why the directive is conditional.
+    candidates_text, fit_seen = render_search_candidates(candidates)
 
     # Gate BE1 — system is now TWO blocks, not one concatenated string. The
     # cache breakpoint sits on the stable half; render order is tools ->
@@ -1968,8 +2028,10 @@ def search():
             "text": SEARCH_SYSTEM_DIRECTIVES,
             "cache_control": {"type": "ephemeral"},
         },
-        {"type": "text", "text": candidates_text},
     ]
+    if fit_seen:
+        system_blocks.append({"type": "text", "text": FIT_DIRECTIVES})
+    system_blocks.append({"type": "text", "text": candidates_text})
 
     anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     messages = conversation + [{"role": "user", "content": query}]
