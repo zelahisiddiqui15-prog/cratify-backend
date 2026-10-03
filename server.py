@@ -306,6 +306,14 @@ Guidelines for your response:
   It is NOT a record of usage. A drag means the user pulled the file in to try it; they may have kept it or deleted it thirty seconds later inside their DAW, and Cratify cannot see which. So NEVER say or imply that one of these is "in your track", "already in the song", "the kick you're using", or that they added/chose/committed to it. If you refer to one at all, the honest framing is "the one you pulled in earlier" or "since you were leaning toward X".
   Practical use: do not re-recommend a file that is already on that list unless you have a specific reason, and say the reason ("still the best fit for this, even though you've already tried it"). Prefer offering things that COMPLEMENT the direction the list shows.
   If there is no such line, the user has tried nothing in this project yet — say nothing about it either way.
+- WHAT THE ROLE WORD MEANS (ASK1 rule 5, ruled 2026-10-02). Some words a producer types name a role the library spells differently. These are not preferences, they are what the word MEANS:
+  "DRUM LOOPS" / "a drum loop" / "a break" = FULL LOOPS, four seconds or longer. NEVER a fill, a tom, a hit or a one-shot, however the file is tagged. Measured on this library: 164 rows typed `sample_type='loop'` are under three seconds and 153 name themselves a fill or a tom, so the tag cannot be trusted — read the duration on the row and read the name. A 1.8-second file called "Fill" is not a drum loop even when it sits at exactly the project tempo.
+  "CHORDS" = chord loops and chord MIDI first, then keys or piano presets. Pads come last: a pad is a texture, not a chord.
+  A STRUCTURAL ASK ("something for the build", "a riser", "a fill") works the same way: the file must BE that part, not merely sit near it.
+  If honouring this leaves you fewer than four picks, RETURN FEWER. A short honest crate beats eight files three of which are hits.
+- A BUILD ASK, SPECIFICALLY (ASK1, ruled 2026-10-02). When the ask names a structural part, ANY CATEGORY QUALIFIES as long as the file's own name or tags carry that word — a bass riser is build material, so is an FX sweep, so is a drum build. Do not restrict yourself to Drums and FX.
+  TWO SIEVES, both measured: the file must be at least TWO SECONDS (a build is a passage, and a 0.4-second stab named "build" is not one), and AUDIO COMES FIRST. A preset is not a build — it is a sound you would then have to play one.
+  PRESETS ONLY WHEN THE AUDIO IS NOT THERE: if fewer than three audio rows in the candidate list carry the structural word, you may fall back to presets, AND `unmet` must say so — "only three real build loops in here, the rest are presets you'd have to play in".
 - THE CURRENT ASK DECIDES (ASK1, ruled 2026-10-01). The latest user message decides the KIND of file and the CATEGORY. Earlier turns are BACKGROUND — they tell you what the producer is working on, and they are never a reason to return a file the current ask did not call for.
   This is the opposite failure to the CONTEXT rule above, and both are real. A follow-up with no category of its own inherits one ("okay how about serum?" after a bass hunt is SERUM BASS). But an ask that names its own instrument, role or file kind has already said what it wants, and the earlier turn cannot overrule it.
   MEASURED, on this library 2026-10-01: an ask for "some drum loops for this song" came back led by a 2.2-second file named "Illenium Style Fill" — from rank 44 of 50 — because the producer had asked for an Illenium fill earlier in the same thread. The conversation outranked the current words, and the current words said "loops".
@@ -1985,6 +1993,47 @@ def _key_name(k):
     return f"{ROOTS[k['pc'] % 12]}{'m' if k.get('minor') else ''}"
 
 
+# ── ASK1 ruling 4 (ruled 2026-10-02) — THE SONG NOTE, IN CODE ─────────
+#
+# The directive asks the model to mention, in one line, what the producer
+# already has in this song. Measured over three identical passes of
+# a06-yi-reopen on 2026-10-02: PASS / FAIL / FAIL. The picks were clean every
+# time — full loops, nothing already dragged — and only the SENTENCE was
+# missing.
+#
+# Zee: "the song mention becomes deterministic — when ALREADY IN THIS SONG is
+# non-empty, append one fixed line in code, like the MIDI caveat. Don't rely on
+# the model." So this is BATTERY-FIX A's mechanism applied to a second
+# sentence, for the same reason: a directive can ask, it cannot guarantee.
+#
+# It names the files from the CANDIDATE LIST, not from the whole project: those
+# are the ones relevant to this ask. The filename is read out of `meta_text`
+# the way the MIDI check reads it — Gate C11 guarantees the filename leads it.
+_ALREADY_SAID = _re.compile(
+    r"already (have|got|own|in)|you have|in (this|your) song|in the (song|track|session)"
+    r"|(pulled|dragged) (it |that |one )?in",
+    _re.I,
+)
+
+
+def song_note(in_song_names):
+    """The one line, or None. Shape is fixed; only the names vary."""
+    names = [n for n in in_song_names if isinstance(n, str) and n.strip()]
+    if not names:
+        return None
+    shown = names[:2]
+    rest = len(names) - len(shown)
+    tail = f", and {rest} more" if rest > 0 else ""
+    return f"You already have {' and '.join(shown)}{tail} in this song."
+
+
+def needs_song_note(reply, in_song_names):
+    """True when there is something to say and the model did not say it."""
+    if song_note(in_song_names) is None:
+        return False
+    return not _ALREADY_SAID.search(str(reply or ""))
+
+
 def needs_midi_caveat(reply, picked_ids, midi_ids):
     """True when the prose promises a warp over a crate that contains MIDI
     and never states the limit. Idempotent by construction."""
@@ -2264,6 +2313,33 @@ def search():
                     flush=True,
                 )
 
+    # ── ASK1 ruling 3 (ruled 2026-10-02) — ONE FILE, ONCE ────────────
+    #
+    # Measured on a04-id-build, 2026-10-02: the reply returned
+    # "Build Kick.fst" TWICE in one crate. Two rows pointing at one file is
+    # eight picks that are really seven, and the second one displaces a file
+    # the producer has not seen. The model is not asked to be careful about
+    # this; it is enforced.
+    #
+    # FIRST OCCURRENCE WINS, because the model ranks best-first and its reason
+    # for the first mention is the one its reply is built around.
+    _seen_ids = set()
+    _deduped = []
+    for _p in picks_raw:
+        _pid = _p.get("id") if isinstance(_p, dict) else None
+        if _pid is not None and _pid in _seen_ids:
+            continue
+        if _pid is not None:
+            _seen_ids.add(_pid)
+        _deduped.append(_p)
+    if len(_deduped) != len(picks_raw):
+        print(
+            f"[search] DUPLICATE PICKS DROPPED — {len(picks_raw)} picks carried "
+            f"{len(_deduped)} distinct files",
+            flush=True,
+        )
+        picks_raw = _deduped
+
     # BATTERY-FIX A — the caveat, appended before anything reads the reply
     # (mention spans are validated against the FINAL text further down).
     #
@@ -2284,6 +2360,22 @@ def search():
         print(
             f"[search] MIDI CAVEAT APPENDED — {sum(1 for p in _picked_ids if p in _midi_ids)}"
             f" of {len(_picked_ids)} picks are MIDI and the reply claimed a warp without the limit",
+            flush=True,
+        )
+
+    # ASK1 ruling 4 — the song note, appended on the same principle as the
+    # caveat above and in the same place, so both land before anything reads
+    # the reply (mention spans are validated against the FINAL text below).
+    _in_song_names = [
+        str(c.get("meta_text", "")).split(" — ")[0].strip()
+        for c in candidates
+        if isinstance(c, dict) and c.get("in_song") is True
+    ]
+    if needs_song_note(reply_val, _in_song_names):
+        reply_val = reply_val.rstrip() + " " + song_note(_in_song_names)
+        print(
+            f"[search] SONG NOTE APPENDED — {len(_in_song_names)} file(s) already in this song "
+            f"and the reply did not say so",
             flush=True,
         )
 
